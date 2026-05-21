@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseConfig(t *testing.T) {
@@ -169,5 +171,45 @@ func TestParseHeaders_EmptyFile(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("expected 0 headers, got %d", len(got))
+	}
+}
+
+func TestExpandPattern(t *testing.T) {
+	vars := PathVars("testuser", time.Date(2026, 5, 22, 14, 30, 0, 0, time.UTC), 0)
+	pattern := "videos/{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}"
+
+	got, err := ExpandPattern(pattern, vars)
+	if err != nil {
+		t.Fatalf("ExpandPattern error: %v", err)
+	}
+	expected := "videos/testuser_2026-05-22_14-30-00"
+	if got != expected {
+		t.Errorf("expected %q, got %q", expected, got)
+	}
+}
+
+func TestExpandPattern_WithSequence(t *testing.T) {
+	vars := PathVars("testuser", time.Date(2026, 5, 22, 14, 30, 0, 0, time.UTC), 3)
+	pattern := "videos/{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}"
+
+	got, err := ExpandPattern(pattern, vars)
+	if err != nil {
+		t.Fatalf("ExpandPattern error: %v", err)
+	}
+	if !strings.Contains(got, "_3") {
+		t.Errorf("expected sequence suffix in %q", got)
+	}
+}
+
+func TestExpandPattern_NoSequenceWhenZero(t *testing.T) {
+	vars := PathVars("testuser", time.Date(2026, 5, 22, 14, 30, 0, 0, time.UTC), 0)
+	pattern := "videos/{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}"
+
+	got, err := ExpandPattern(pattern, vars)
+	if err != nil {
+		t.Fatalf("ExpandPattern error: %v", err)
+	}
+	if strings.Contains(got, "_0") {
+		t.Errorf("expected no sequence suffix when seq=0, got %q", got)
 	}
 }

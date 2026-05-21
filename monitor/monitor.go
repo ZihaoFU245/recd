@@ -9,6 +9,12 @@ import (
 	"recd/config"
 )
 
+// respawnDelayError is the delay before retrying a channel that failed with an error.
+const respawnDelayError = 60 * time.Second
+
+// shutdownTimeout is the maximum time to wait for channel goroutines to finish during shutdown.
+const shutdownTimeout = 10 * time.Second
+
 type Monitor struct {
 	ctx      *config.AppContext
 	configs  []config.ChannelConfig
@@ -16,15 +22,26 @@ type Monitor struct {
 	mu       sync.Mutex
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+
+	// resultCh receives recording outcomes from channel goroutines.
+	resultCh chan channel.Result
+
+	// respawnAfter schedules delayed retries for channels that failed with errors.
+	respawnAfter map[string]time.Time
+
+	// wg tracks active channel goroutines for graceful shutdown.
+	wg sync.WaitGroup
 }
 
 func New(ctx *config.AppContext, configs []config.ChannelConfig) *Monitor {
 	return &Monitor{
-		ctx:      ctx,
-		configs:  configs,
-		channels: make(map[string]*channel.Channel),
-		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
+		ctx:          ctx,
+		configs:      configs,
+		channels:     make(map[string]*channel.Channel),
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan struct{}),
+		resultCh:     make(chan channel.Result, 64),
+		respawnAfter: make(map[string]time.Time),
 	}
 }
 
@@ -37,6 +54,10 @@ func (m *Monitor) Run() {
 	}()
 
 	m.ctx.Logger.Info("monitor watching channels", "count", len(m.configs))
+
+	// Run an immediate tick to check streams without waiting for the first interval.
+	m.tick()
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -45,16 +66,47 @@ func (m *Monitor) Run() {
 		case <-m.stopCh:
 			m.ctx.Logger.Info("monitor stopping")
 			m.shutdownAllChannels()
+			// Wait for all channel goroutines to finish (best-effort, with timeout).
+			waitWithTimeout(&m.wg, shutdownTimeout)
 			return
+
 		case <-ticker.C:
 			m.tick()
+
+		case result := <-m.resultCh:
+			m.handleResult(result)
 		}
+	}
+}
+
+// waitWithTimeout waits for a WaitGroup up to the given duration, then returns.
+func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
 	}
 }
 
 func (m *Monitor) tick() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Check channels with pending retries.
+	now := time.Now()
+	for username, retryAt := range m.respawnAfter {
+		if now.After(retryAt) {
+			delete(m.respawnAfter, username)
+			m.ctx.Logger.Info("retrying after error delay", "username", username)
+			if online, hlsSource := m.checkStreamStatus(username); online {
+				m.startChannelLocked(username, hlsSource)
+			}
+		}
+	}
 
 	for _, cfg := range m.configs {
 		ch, exists := m.channels[cfg.Username]
@@ -68,20 +120,76 @@ func (m *Monitor) tick() {
 			continue
 		}
 
+		// Skip channels that are waiting for retry.
+		if _, waiting := m.respawnAfter[cfg.Username]; waiting {
+			continue
+		}
+
 		if online, hlsSource := m.checkStreamStatus(cfg.Username); online {
-			ch := channel.New(m.ctx, cfg, hlsSource)
-			m.channels[cfg.Username] = ch
-			go recoverable("channel:"+cfg.Username, ch.Run)
-			m.ctx.Logger.Info("stream online, starting channel", "username", cfg.Username, "hls_source", hlsSource != "")
+			m.startChannelLocked(cfg.Username, hlsSource)
 		}
 	}
 }
 
-func (m *Monitor) checkStreamStatus(username string) (online bool, hlsSource string) {
-	// TODO: fetch https://chaturbate.com/{username}/ via m.ctx.Resty
-	// extract window.initialRoomDossier, decode unicode escapes,
-	// unmarshal into RoomDossier, check room_status == "public"
-	return false, ""
+// startChannelLocked creates and starts a new channel goroutine.
+// Must be called with m.mu held.
+func (m *Monitor) startChannelLocked(username, hlsSource string) {
+	var cfg config.ChannelConfig
+	for _, c := range m.configs {
+		if c.Username == username {
+			cfg = c
+			break
+		}
+	}
+	ch := channel.New(m.ctx, cfg, hlsSource, m.resultCh)
+	m.channels[username] = ch
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		recoverable("channel:"+username, ch.Run)
+	}()
+
+	m.ctx.Logger.Info("stream online, starting channel",
+		"username", username,
+		"hls_source", hlsSource != "",
+	)
+}
+
+// handleResult processes a recording outcome from a channel goroutine.
+// Normal completions trigger an immediate respawn if the stream is still online.
+// Errors schedule a delayed retry to avoid tight crash loops.
+func (m *Monitor) handleResult(r channel.Result) {
+	m.ctx.Logger.Info("channel finished",
+		"username", r.Username,
+		"status", r.Status.String(),
+		"duration", r.Duration,
+		"size", r.Filesize,
+		"path", r.Path,
+		"error", r.Err,
+	)
+
+	m.mu.Lock()
+	delete(m.channels, r.Username)
+	m.mu.Unlock()
+
+	switch r.Status {
+	case channel.StatusCompleted, channel.StatusMaxDuration, channel.StatusMaxFilesize:
+		m.mu.Lock()
+		if online, hlsSource := m.checkStreamStatus(r.Username); online {
+			m.startChannelLocked(r.Username, hlsSource)
+		}
+		m.mu.Unlock()
+
+	case channel.StatusError, channel.StatusDesync:
+		m.ctx.Logger.Info("scheduling retry after error",
+			"username", r.Username,
+			"delay", respawnDelayError,
+		)
+		m.mu.Lock()
+		m.respawnAfter[r.Username] = time.Now().Add(respawnDelayError)
+		m.mu.Unlock()
+	}
 }
 
 func (m *Monitor) isStreamOnline(username string) bool {

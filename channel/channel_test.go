@@ -16,7 +16,7 @@ func testContext() *config.AppContext {
 
 func TestChannelLifecycle(t *testing.T) {
 	ctx := testContext()
-	ch := New(ctx, config.ChannelConfig{Username: "test_user", Resolution: 720}, "")
+	ch := New(ctx, config.ChannelConfig{Username: "test_user", Resolution: 720}, "", nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -43,7 +43,7 @@ func TestChannelLifecycle(t *testing.T) {
 
 func TestChannelDoubleRun(t *testing.T) {
 	ctx := testContext()
-	ch := New(ctx, config.ChannelConfig{Username: "test_user"}, "")
+	ch := New(ctx, config.ChannelConfig{Username: "test_user"}, "", nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -89,7 +89,7 @@ func TestChannelPanicRecovery(t *testing.T) {
 
 func TestChannelStopBeforeRun(t *testing.T) {
 	ctx := testContext()
-	ch := New(ctx, config.ChannelConfig{Username: "early_stop"}, "")
+	ch := New(ctx, config.ChannelConfig{Username: "early_stop"}, "", nil)
 
 	ch.Stop() // close stopCh before Run
 
@@ -109,7 +109,7 @@ func TestChannelStopBeforeRun(t *testing.T) {
 func TestChannelHlsSource(t *testing.T) {
 	ctx := testContext()
 	hls := "https://edge1-sin.live.mmcdn.com/v1/edge/streams/origin.test_user.01A2B3C4D5/llhls.m3u8?token=abc"
-	ch := New(ctx, config.ChannelConfig{Username: "test_user"}, hls)
+	ch := New(ctx, config.ChannelConfig{Username: "test_user"}, hls, nil)
 
 	if ch.hlsSource != hls {
 		t.Errorf("expected hlsSource %q, got %q", hls, ch.hlsSource)

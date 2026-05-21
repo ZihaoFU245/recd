@@ -36,6 +36,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Ensure the videos output directory exists.
+	if err := os.MkdirAll("videos", 0755); err != nil {
+		logger.Error("failed to create videos directory", "error", err)
+		os.Exit(1)
+	}
+
 	var headers map[string]string
 	if *headersPath != "" {
 		var err error

@@ -2,7 +2,6 @@ package channel
 
 import (
 	"sync"
-	"time"
 
 	"recd/config"
 )
@@ -11,21 +10,27 @@ type Channel struct {
 	ctx       *config.AppContext
 	cfg       config.ChannelConfig
 	hlsSource string
+	resultCh  chan<- Result
 	stopCh    chan struct{}
 	stopOnce  sync.Once
 	mu        sync.Mutex
 	active    bool
 }
 
-func New(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string) *Channel {
+// New creates a new channel goroutine handle. The resultCh is used to
+// send the recording outcome back to the monitor when the session ends.
+func New(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string, resultCh chan<- Result) *Channel {
 	return &Channel{
 		ctx:       ctx,
 		cfg:       cfg,
 		hlsSource: hlsSource,
+		resultCh:  resultCh,
 		stopCh:    make(chan struct{}),
 	}
 }
 
+// Run starts the recording loop. It blocks until the channel is stopped
+// or the recording finishes naturally. The outcome is sent on resultCh.
 func (c *Channel) Run() {
 	c.mu.Lock()
 	if c.active {
@@ -41,6 +46,14 @@ func (c *Channel) Run() {
 		c.mu.Unlock()
 		if r := recover(); r != nil {
 			c.ctx.Logger.Error("goroutine panic", "name", "channel:"+c.cfg.Username, "panic", r)
+			// Send a panic result so the monitor knows this channel died.
+			if c.resultCh != nil {
+				c.resultCh <- Result{
+					Username: c.cfg.Username,
+					Status:   StatusError,
+					Err:      &panicError{panic: r},
+				}
+			}
 		}
 	}()
 
@@ -52,33 +65,35 @@ func (c *Channel) Run() {
 		"hls_source", c.hlsSource != "",
 	)
 
-	c.recordLoop()
-}
+	// Run the actual recording; blocks until stop or completion.
+	result := record(c.ctx, c.cfg, c.hlsSource, c.stopCh)
 
-func (c *Channel) recordLoop() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.stopCh:
-			c.ctx.Logger.Info("recording stopped", "username", c.cfg.Username)
-			return
-		case <-ticker.C:
-			c.downloadSegments()
-		}
+	// Notify monitor of the outcome.
+	if c.resultCh != nil {
+		c.resultCh <- result
 	}
 }
 
-func (c *Channel) downloadSegments() {
-	// TODO: fetch m3u8 master playlist via c.hlsSource, parse with m3u8 lib,
-	// select variant matching c.cfg.Resolution, fetch chunklist,
-	// download .m4s segments via c.ctx.Resty
-	c.ctx.Logger.Debug("downloading segments", "username", c.cfg.Username)
-}
-
+// Stop signals the channel to finish recording gracefully, finalize the
+// output file, and exit the Run() goroutine. Safe to call multiple times.
 func (c *Channel) Stop() {
 	c.stopOnce.Do(func() {
 		close(c.stopCh)
 	})
+}
+
+// panicError wraps a recovered panic value as an error.
+type panicError struct{ panic any }
+
+func (e *panicError) Error() string { return "panic: " + sprintAny(e.panic) }
+
+func sprintAny(v any) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case error:
+		return val.Error()
+	default:
+		return "(unknown)"
+	}
 }
