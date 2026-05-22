@@ -20,6 +20,41 @@ type ChannelConfig struct {
 	CreatedAt   int64  `json:"created_at"`
 }
 
+// ComputeDelta compares old and new channel configs and returns the channels
+// that changed. Channels added or modified appear with their new config.
+// Channels that exist in old but not in new appear with IsPaused=true.
+func ComputeDelta(old, new []ChannelConfig) []ChannelConfig {
+	oldMap := make(map[string]ChannelConfig, len(old))
+	for _, c := range old {
+		oldMap[c.Username] = c
+	}
+	newMap := make(map[string]ChannelConfig, len(new))
+	for _, c := range new {
+		newMap[c.Username] = c
+	}
+
+	var delta []ChannelConfig
+
+	// Added or changed: present in new config.
+	for _, newCfg := range new {
+		oldCfg, existed := oldMap[newCfg.Username]
+		if !existed || oldCfg != newCfg {
+			delta = append(delta, newCfg)
+		}
+	}
+
+	// Removed: present in old but missing from new. Mark as paused.
+	for _, oldCfg := range old {
+		if _, exists := newMap[oldCfg.Username]; !exists {
+			cfg := oldCfg
+			cfg.IsPaused = true
+			delta = append(delta, cfg)
+		}
+	}
+
+	return delta
+}
+
 type RoomDossier struct {
 	RoomStatus          string `json:"room_status"`
 	HlsSource           string `json:"hls_source"`

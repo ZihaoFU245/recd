@@ -12,6 +12,7 @@ type Channel struct {
 	hlsSource string
 	resultCh  chan<- Result
 	stopCh    chan struct{}
+	reloadCh  chan struct{}
 	stopOnce  sync.Once
 	mu        sync.Mutex
 	active    bool
@@ -26,6 +27,7 @@ func New(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string, res
 		hlsSource: hlsSource,
 		resultCh:  resultCh,
 		stopCh:    make(chan struct{}),
+		reloadCh:  make(chan struct{}, 1),
 	}
 }
 
@@ -66,7 +68,7 @@ func (c *Channel) Run() {
 	)
 
 	// Run the actual recording; blocks until stop or completion.
-	result := record(c.ctx, c.cfg, c.hlsSource, c.stopCh)
+	result := record(c.ctx, c.cfg, c.hlsSource, c.stopCh, c.reloadCh)
 
 	// Notify monitor of the outcome.
 	if c.resultCh != nil {
@@ -80,6 +82,16 @@ func (c *Channel) Stop() {
 	c.stopOnce.Do(func() {
 		close(c.stopCh)
 	})
+}
+
+// Reload signals the channel to stop recording due to a config reload.
+// The Run() goroutine will exit with a StatusCompleted result and Reloaded=true.
+// Non-blocking; no-op if a reload signal is already pending.
+func (c *Channel) Reload() {
+	select {
+	case c.reloadCh <- struct{}{}:
+	default:
+	}
 }
 
 // panicError wraps a recovered panic value as an error.

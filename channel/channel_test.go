@@ -130,3 +130,62 @@ func TestChannelHlsSource(t *testing.T) {
 		t.Fatal("channel Run() did not return after Stop()")
 	}
 }
+
+func TestChannelReload(t *testing.T) {
+	ctx := testContext()
+	resultCh := make(chan Result, 1)
+	ch := New(ctx, config.ChannelConfig{Username: "reload_user"}, "", resultCh)
+
+	done := make(chan struct{})
+	go func() {
+		ch.Run()
+		close(done)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	ch.Reload()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("channel Run() did not return after Reload()")
+	}
+
+	// With empty hlsSource, record() returns StatusError immediately,
+	// before reaching the reloadCh select case. So Reloaded=false.
+	select {
+	case result := <-resultCh:
+		if result.Reloaded {
+			t.Log("channel returned with Reloaded=true (reloadCh reached)")
+		}
+		if result.Status != StatusError {
+			t.Errorf("expected StatusError with empty hlsSource, got %v", result.Status)
+		}
+	default:
+	}
+}
+
+func TestChannelReload_Idempotent(t *testing.T) {
+	ctx := testContext()
+	ch := New(ctx, config.ChannelConfig{Username: "reload_multi"}, "", nil)
+
+	done := make(chan struct{})
+	go func() {
+		ch.Run()
+		close(done)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+
+	// Multiple Reload calls should not panic.
+	ch.Reload()
+	ch.Reload()
+	ch.Reload()
+	ch.Stop()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("channel Run() did not return after Reload() + Stop()")
+	}
+}

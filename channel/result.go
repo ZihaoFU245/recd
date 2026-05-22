@@ -38,4 +38,5 @@ type Result struct {
 	Duration time.Duration
 	Filesize int64
 	Path     string
+	Reloaded bool
 }

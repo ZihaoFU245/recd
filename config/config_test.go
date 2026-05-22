@@ -213,3 +213,143 @@ func TestExpandPattern_NoSequenceWhenZero(t *testing.T) {
 		t.Errorf("expected no sequence suffix when seq=0, got %q", got)
 	}
 }
+
+func TestComputeDelta_NoChange(t *testing.T) {
+	old := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 480},
+	}
+	new := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 480},
+	}
+	delta := ComputeDelta(old, new)
+	if len(delta) != 0 {
+		t.Errorf("expected empty delta, got %d entries", len(delta))
+	}
+}
+
+func TestComputeDelta_Added(t *testing.T) {
+	old := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 480},
+	}
+	new := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 480},
+		{IsPaused: false, Username: "user2", Resolution: 720},
+	}
+	delta := ComputeDelta(old, new)
+	if len(delta) != 1 {
+		t.Fatalf("expected 1 delta entry, got %d", len(delta))
+	}
+	if delta[0].Username != "user2" {
+		t.Errorf("expected user2, got %s", delta[0].Username)
+	}
+}
+
+func TestComputeDelta_Removed(t *testing.T) {
+	old := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 480},
+		{IsPaused: false, Username: "user2", Resolution: 720},
+	}
+	new := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 480},
+	}
+	delta := ComputeDelta(old, new)
+	if len(delta) != 1 {
+		t.Fatalf("expected 1 delta entry, got %d", len(delta))
+	}
+	if delta[0].Username != "user2" {
+		t.Errorf("expected user2, got %s", delta[0].Username)
+	}
+	if !delta[0].IsPaused {
+		t.Error("expected removed channel to be marked IsPaused=true")
+	}
+}
+
+func TestComputeDelta_Changed(t *testing.T) {
+	old := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 480, MaxDuration: 60},
+	}
+	new := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 720, MaxDuration: 120},
+	}
+	delta := ComputeDelta(old, new)
+	if len(delta) != 1 {
+		t.Fatalf("expected 1 delta entry, got %d", len(delta))
+	}
+	if delta[0].Username != "user1" {
+		t.Errorf("expected user1, got %s", delta[0].Username)
+	}
+	if delta[0].Resolution != 720 {
+		t.Errorf("expected resolution 720, got %d", delta[0].Resolution)
+	}
+}
+
+func TestComputeDelta_PausedToActive(t *testing.T) {
+	old := []ChannelConfig{
+		{IsPaused: true, Username: "user1", Resolution: 480},
+	}
+	new := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 480},
+	}
+	delta := ComputeDelta(old, new)
+	if len(delta) != 1 {
+		t.Fatalf("expected 1 delta entry, got %d", len(delta))
+	}
+	if delta[0].IsPaused {
+		t.Error("expected IsPaused=false")
+	}
+}
+
+func TestComputeDelta_ActiveToPaused(t *testing.T) {
+	old := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 480},
+	}
+	new := []ChannelConfig{
+		{IsPaused: true, Username: "user1", Resolution: 480},
+	}
+	delta := ComputeDelta(old, new)
+	if len(delta) != 1 {
+		t.Fatalf("expected 1 delta entry, got %d", len(delta))
+	}
+	if !delta[0].IsPaused {
+		t.Error("expected IsPaused=true")
+	}
+}
+
+func TestComputeDelta_Mixed(t *testing.T) {
+	old := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 480},
+		{IsPaused: true, Username: "user2", Resolution: 720},
+		{IsPaused: false, Username: "user3", Resolution: 1080},
+	}
+	new := []ChannelConfig{
+		{IsPaused: false, Username: "user1", Resolution: 720},
+		{IsPaused: false, Username: "user2", Resolution: 720},
+		{IsPaused: false, Username: "user4", Resolution: 360},
+	}
+	delta := ComputeDelta(old, new)
+	if len(delta) != 4 {
+		t.Fatalf("expected 4 delta entries (user1 changed, user2 unpaused, user3 removed, user4 added), got %d", len(delta))
+	}
+
+	find := func(username string) *ChannelConfig {
+		for i, d := range delta {
+			if d.Username == username {
+				return &delta[i]
+			}
+		}
+		return nil
+	}
+
+	if d := find("user1"); d == nil || d.Resolution != 720 || d.IsPaused {
+		t.Error("user1 should be changed (resolution 720, not paused)")
+	}
+	if d := find("user2"); d == nil || d.IsPaused {
+		t.Error("user2 should be unpaused")
+	}
+	if d := find("user3"); d == nil || !d.IsPaused {
+		t.Error("user3 should be removed (IsPaused=true)")
+	}
+	if d := find("user4"); d == nil || d.Resolution != 360 || d.IsPaused {
+		t.Error("user4 should be added")
+	}
+}

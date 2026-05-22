@@ -167,7 +167,14 @@ func (m *Monitor) handleResult(r channel.Result) {
 		"size", r.Filesize,
 		"path", r.Path,
 		"error", r.Err,
+		"reloaded", r.Reloaded,
 	)
+
+	if r.Reloaded {
+		// Reload already removed the old channel from m.channels and started
+		// a new one. Don't touch m.channels, don't schedule restart/retry.
+		return
+	}
 
 	m.mu.Lock()
 	delete(m.channels, r.Username)
@@ -190,6 +197,67 @@ func (m *Monitor) handleResult(r channel.Result) {
 		m.respawnAfter[r.Username] = time.Now().Add(respawnDelayError)
 		m.mu.Unlock()
 	}
+}
+
+// Reload applies a config delta to the monitor. Channels with IsPaused=true
+// are stopped and removed from tracking. Other channels are added/updated:
+// running channels are signaled via Reload() and a new goroutine is spawned
+// immediately if the stream is online.
+func (m *Monitor) Reload(delta []config.ChannelConfig) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, newCfg := range delta {
+		if newCfg.IsPaused {
+			if ch, ok := m.channels[newCfg.Username]; ok {
+				ch.Stop()
+				delete(m.channels, newCfg.Username)
+				m.ctx.Logger.Info("channel paused or removed, stopping", "username", newCfg.Username)
+			}
+			m.removeFromConfigsLocked(newCfg.Username)
+			delete(m.respawnAfter, newCfg.Username)
+			continue
+		}
+
+		// Not paused — upsert config and clear any pending retry.
+		m.upsertConfigLocked(newCfg)
+		delete(m.respawnAfter, newCfg.Username)
+
+		// If currently running, signal reload and forget the old channel.
+		if ch, ok := m.channels[newCfg.Username]; ok {
+			ch.Reload()
+			delete(m.channels, newCfg.Username)
+			m.ctx.Logger.Info("channel reload triggered", "username", newCfg.Username)
+		}
+
+		// Start new channel immediately if stream is online.
+		if online, hlsSource := m.checkStreamStatus(newCfg.Username); online {
+			m.startChannelLocked(newCfg.Username, hlsSource)
+		}
+	}
+}
+
+// removeFromConfigsLocked removes a channel config by username from m.configs.
+// Must be called with m.mu held.
+func (m *Monitor) removeFromConfigsLocked(username string) {
+	for i, c := range m.configs {
+		if c.Username == username {
+			m.configs = append(m.configs[:i], m.configs[i+1:]...)
+			return
+		}
+	}
+}
+
+// upsertConfigLocked replaces an existing config for username or appends a new
+// one to m.configs. Must be called with m.mu held.
+func (m *Monitor) upsertConfigLocked(cfg config.ChannelConfig) {
+	for i, c := range m.configs {
+		if c.Username == cfg.Username {
+			m.configs[i] = cfg
+			return
+		}
+	}
+	m.configs = append(m.configs, cfg)
 }
 
 func (m *Monitor) isStreamOnline(username string) bool {

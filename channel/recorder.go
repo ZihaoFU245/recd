@@ -45,7 +45,8 @@ type trackState struct {
 // record starts a long-running ffmpeg process that reads video (+ optional audio)
 // from OS pipes and writes a single MKV output file continuously.
 // Segments are downloaded and fed directly into the pipes — no temp files.
-func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string, stopCh <-chan struct{}) (res Result) {
+func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
+	stopCh <-chan struct{}, reloadCh <-chan struct{}) (res Result) {
 	res.Username = cfg.Username
 
 	t0 := time.Now()
@@ -274,6 +275,11 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string, 
 		case <-stopCh:
 			ctx.Logger.Info("recording stopped by monitor", "username", cfg.Username)
 			res.Status = StatusCompleted
+			goto finish
+		case <-reloadCh:
+			ctx.Logger.Info("recording reload triggered", "username", cfg.Username)
+			res.Status = StatusCompleted
+			res.Reloaded = true
 			goto finish
 		case <-poll.C:
 		}
