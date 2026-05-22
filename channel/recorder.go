@@ -29,6 +29,7 @@ const (
 
 var (
 	errChunklistExpired = fmt.Errorf("chunklist expired")
+	mergeMediaFiles     = mergeTempFiles
 )
 
 type trackState struct {
@@ -280,7 +281,6 @@ func recordWithTempFiles(ctx *config.AppContext, cfg config.ChannelConfig, hlsSo
 	videoPath := videoFile.Name()
 	defer func() {
 		videoFile.Close()
-		os.Remove(videoPath)
 	}()
 
 	audioFile, err := os.CreateTemp("", "rec_audio_*.bin")
@@ -292,7 +292,6 @@ func recordWithTempFiles(ctx *config.AppContext, cfg config.ChannelConfig, hlsSo
 	audioPath := audioFile.Name()
 	defer func() {
 		audioFile.Close()
-		os.Remove(audioPath)
 	}()
 
 	vs := trackState{url: videoChunkURL, writer: videoFile, name: "video"}
@@ -411,24 +410,87 @@ finish:
 	videoFile.Close()
 	audioFile.Close()
 
-	if res.Status == StatusError || res.Status == StatusDesync {
-		res.Duration = time.Since(t0)
-		res.Path = outputPath
-		return
-	}
-	if mustFileSize(videoPath) == 0 || mustFileSize(audioPath) == 0 {
+	finalizeTempRecording(ctx, cfg.Username, videoPath, audioPath, outputPath, t0, &res)
+	return
+}
+
+func finalizeTempRecording(ctx *config.AppContext, username, videoPath, audioPath, outputPath string, t0 time.Time, res *Result) {
+	res.Duration = time.Since(t0)
+	res.Path = outputPath
+
+	videoSize := mustFileSize(videoPath)
+	audioSize := mustFileSize(audioPath)
+	if videoSize == 0 || audioSize == 0 {
+		if res.Err == nil {
+			res.Err = fmt.Errorf("no media segments recorded")
+		}
 		res.Status = StatusError
-		res.Err = fmt.Errorf("no media segments recorded")
-		res.Duration = time.Since(t0)
-		res.Path = outputPath
+		ctx.Logger.Error("recording has no mergeable media",
+			"username", username,
+			"video_tmp", videoPath,
+			"audio_tmp", audioPath,
+			"video_size", videoSize,
+			"audio_size", audioSize,
+			"error", res.Err,
+		)
 		return
 	}
 
+	mergeErr := mergeMediaFiles(ctx, username, videoPath, audioPath, outputPath, videoSize, audioSize)
+	if mergeErr != nil {
+		res.Status = StatusError
+		if res.Err != nil {
+			res.Err = fmt.Errorf("%w; merge: %v", res.Err, mergeErr)
+		} else {
+			res.Err = fmt.Errorf("merge: %w", mergeErr)
+		}
+		ctx.Logger.Error("recording kept temp files after merge failure",
+			"username", username,
+			"video_tmp", videoPath,
+			"audio_tmp", audioPath,
+			"error", res.Err,
+		)
+		return
+	}
+
+	if fi, err := os.Stat(outputPath); err == nil {
+		res.Filesize = fi.Size()
+	}
+	if res.Filesize == 0 {
+		res.Status = StatusError
+		if res.Err != nil {
+			res.Err = fmt.Errorf("%w; empty output after merge", res.Err)
+		} else {
+			res.Err = fmt.Errorf("empty output after merge")
+		}
+		ctx.Logger.Error("recording kept temp files after empty merge output",
+			"username", username,
+			"video_tmp", videoPath,
+			"audio_tmp", audioPath,
+			"output", outputPath,
+			"error", res.Err,
+		)
+		return
+	}
+
+	removeTempFile(ctx, username, "video", videoPath)
+	removeTempFile(ctx, username, "audio", audioPath)
+
+	ctx.Logger.Info("recording finalized",
+		"username", username,
+		"path", outputPath,
+		"size", res.Filesize,
+		"duration", res.Duration,
+		"status", res.Status,
+	)
+}
+
+func mergeTempFiles(ctx *config.AppContext, username, videoPath, audioPath, outputPath string, videoSize, audioSize int64) error {
 	ctx.Logger.Info("merging video and audio",
-		"username", cfg.Username,
+		"username", username,
 		"output", outputPath,
-		"video_size", mustFileSize(videoPath),
-		"audio_size", mustFileSize(audioPath),
+		"video_size", videoSize,
+		"audio_size", audioSize,
 	)
 
 	mergeCmd := exec.Command("ffmpeg",
@@ -447,26 +509,21 @@ finish:
 	)
 	mergeCmd.Stderr = os.Stderr
 	if err := mergeCmd.Run(); err != nil {
-		ctx.Logger.Error("merge failed", "username", cfg.Username, "error", err)
-		res.Status = StatusError
-		res.Err = fmt.Errorf("merge: %w", err)
-		return // defer will clean up temps
+		ctx.Logger.Error("merge failed", "username", username, "error", err)
+		return err
 	}
+	return nil
+}
 
-	if fi, err := os.Stat(outputPath); err == nil {
-		res.Filesize = fi.Size()
+func removeTempFile(ctx *config.AppContext, username, track, path string) {
+	if err := os.Remove(path); err != nil {
+		ctx.Logger.Warn("failed to remove temp file",
+			"username", username,
+			"track", track,
+			"path", path,
+			"error", err,
+		)
 	}
-	res.Duration = time.Since(t0)
-	res.Path = outputPath
-
-	ctx.Logger.Info("recording finalized",
-		"username", cfg.Username,
-		"path", outputPath,
-		"size", res.Filesize,
-		"duration", res.Duration,
-		"status", res.Status,
-	)
-	return
 }
 
 // mustFileSize returns the file size in bytes, or 0 on error.

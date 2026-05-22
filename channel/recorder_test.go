@@ -2,11 +2,15 @@ package channel
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"recd/config"
 )
@@ -74,6 +78,112 @@ func TestProcessTrackErrorsOnSkippedSequence(t *testing.T) {
 	if !strings.Contains(err.Error(), "missed segment") {
 		t.Fatalf("expected missed segment error, got %v", err)
 	}
+}
+
+func TestFinalizeTempRecordingMergesAfterCaptureErrorAndRemovesTemps(t *testing.T) {
+	ctx := testContext()
+	dir := t.TempDir()
+	videoPath := writeTestFile(t, dir, "video.bin", []byte("video"))
+	audioPath := writeTestFile(t, dir, "audio.bin", []byte("audio"))
+	outputPath := filepath.Join(dir, "out.mkv")
+
+	oldMerge := mergeMediaFiles
+	t.Cleanup(func() { mergeMediaFiles = oldMerge })
+
+	var mergeCalled bool
+	mergeMediaFiles = func(_ *config.AppContext, username, gotVideoPath, gotAudioPath, gotOutputPath string, videoSize, audioSize int64) error {
+		mergeCalled = true
+		if username != "angel_from_sky" {
+			t.Fatalf("unexpected username %q", username)
+		}
+		if gotVideoPath != videoPath || gotAudioPath != audioPath || gotOutputPath != outputPath {
+			t.Fatalf("unexpected merge paths: %q %q %q", gotVideoPath, gotAudioPath, gotOutputPath)
+		}
+		if videoSize == 0 || audioSize == 0 {
+			t.Fatalf("expected non-zero temp sizes, got video=%d audio=%d", videoSize, audioSize)
+		}
+		return os.WriteFile(outputPath, []byte("merged"), 0644)
+	}
+
+	captureErr := errors.New("audio segment HTTP 403")
+	res := Result{Username: "angel_from_sky", Status: StatusError, Err: captureErr}
+	finalizeTempRecording(ctx, "angel_from_sky", videoPath, audioPath, outputPath, time.Now(), &res)
+
+	if !mergeCalled {
+		t.Fatal("expected merge to be attempted after capture error")
+	}
+	if res.Status != StatusError {
+		t.Fatalf("expected original error status to remain, got %v", res.Status)
+	}
+	if !errors.Is(res.Err, captureErr) {
+		t.Fatalf("expected original capture error to remain, got %v", res.Err)
+	}
+	if res.Filesize == 0 {
+		t.Fatal("expected finalized output filesize to be recorded")
+	}
+	assertMissing(t, videoPath)
+	assertMissing(t, audioPath)
+	assertExists(t, outputPath)
+}
+
+func TestFinalizeTempRecordingKeepsTempsWhenMergeFails(t *testing.T) {
+	ctx := testContext()
+	dir := t.TempDir()
+	videoPath := writeTestFile(t, dir, "video.bin", []byte("video"))
+	audioPath := writeTestFile(t, dir, "audio.bin", []byte("audio"))
+	outputPath := filepath.Join(dir, "out.mkv")
+
+	oldMerge := mergeMediaFiles
+	t.Cleanup(func() { mergeMediaFiles = oldMerge })
+
+	mergeErr := errors.New("ffmpeg failed")
+	mergeMediaFiles = func(_ *config.AppContext, _, _, _, _ string, _, _ int64) error {
+		return mergeErr
+	}
+
+	captureErr := errors.New("audio segment HTTP 403")
+	res := Result{Username: "angel_from_sky", Status: StatusError, Err: captureErr}
+	finalizeTempRecording(ctx, "angel_from_sky", videoPath, audioPath, outputPath, time.Now(), &res)
+
+	if res.Status != StatusError {
+		t.Fatalf("expected StatusError, got %v", res.Status)
+	}
+	if !errors.Is(res.Err, captureErr) {
+		t.Fatalf("expected capture error to be preserved, got %v", res.Err)
+	}
+	if !strings.Contains(res.Err.Error(), "merge") || !strings.Contains(res.Err.Error(), mergeErr.Error()) {
+		t.Fatalf("expected merge failure in result error, got %v", res.Err)
+	}
+	assertExists(t, videoPath)
+	assertExists(t, audioPath)
+	assertMissing(t, outputPath)
+}
+
+func TestFinalizeTempRecordingKeepsTempsWhenOutputIsEmpty(t *testing.T) {
+	ctx := testContext()
+	dir := t.TempDir()
+	videoPath := writeTestFile(t, dir, "video.bin", []byte("video"))
+	audioPath := writeTestFile(t, dir, "audio.bin", []byte("audio"))
+	outputPath := filepath.Join(dir, "out.mkv")
+
+	oldMerge := mergeMediaFiles
+	t.Cleanup(func() { mergeMediaFiles = oldMerge })
+
+	mergeMediaFiles = func(_ *config.AppContext, _, _, _, gotOutputPath string, _, _ int64) error {
+		return os.WriteFile(gotOutputPath, nil, 0644)
+	}
+
+	res := Result{Username: "angel_from_sky", Status: StatusCompleted}
+	finalizeTempRecording(ctx, "angel_from_sky", videoPath, audioPath, outputPath, time.Now(), &res)
+
+	if res.Status != StatusError {
+		t.Fatalf("expected StatusError for empty output, got %v", res.Status)
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "empty output") {
+		t.Fatalf("expected empty output error, got %v", res.Err)
+	}
+	assertExists(t, videoPath)
+	assertExists(t, audioPath)
 }
 
 type nopWriteCloser struct {
@@ -144,4 +254,27 @@ func mediaPlaylistWithMap(seq uint64, init string, segments []string) string {
 		fmt.Fprintf(&b, "#EXTINF:1.000000,\n%s\n", segment)
 	}
 	return b.String()
+}
+
+func writeTestFile(t *testing.T, dir, name string, data []byte) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func assertExists(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected %s to exist: %v", path, err)
+	}
+}
+
+func assertMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected %s to be missing, stat err=%v", path, err)
+	}
 }
