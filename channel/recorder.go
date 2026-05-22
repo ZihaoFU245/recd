@@ -20,6 +20,16 @@ import (
 const (
 	maxDesyncSeconds    = 60.0
 	segmentPollInterval = 800 * time.Millisecond
+
+	// maxChunklistRetries is the number of times we re-fetch the master
+	// playlist to get a fresh chunklist URL before giving up.
+	maxChunklistRetries = 3
+)
+
+var (
+	// errChunklistExpired is returned by processTrack when the chunklist URL
+	// returns 403 (expired). The caller should refresh the master playlist.
+	errChunklistExpired = fmt.Errorf("chunklist expired")
 )
 
 // trackState holds the state for a single media track during recording.
@@ -137,23 +147,76 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string, 
 	poll := time.NewTicker(segmentPollInterval)
 	defer poll.Stop()
 
+	// Track consecutive chunklist errors for retry backoff.
+	chunklistRetries := 0
+
 	for {
 		// Process video track every cycle.
 		if err := processTrack(ctx, referer, &vs); err != nil {
+			if err == errChunklistExpired && chunklistRetries < maxChunklistRetries {
+				chunklistRetries++
+				ctx.Logger.Warn("chunklist expired, refreshing",
+					"track", "video",
+					"attempt", chunklistRetries,
+					"max", maxChunklistRetries,
+				)
+				vURL, aURL, _, refreshErr := fetchAndSelectVariant(ctx, hlsSource, cfg)
+				if refreshErr != nil {
+					ctx.Logger.Error("failed to refresh variant URLs", "error", refreshErr)
+					res.Status = StatusError
+					res.Err = err
+					goto finish
+				}
+				vs.url = vURL
+				vs.wroteInit = false
+				if hasAudio {
+					as.url = aURL
+					as.wroteInit = false
+				}
+				time.Sleep(time.Duration(chunklistRetries) * time.Second)
+				continue
+			}
 			ctx.Logger.Error("video track error", "username", cfg.Username, "error", err)
 			res.Status = StatusError
 			res.Err = err
 			goto finish
 		}
+		chunklistRetries = 0 // reset on success
 
 		// Process audio track only if we have a separate audio stream.
 		if hasAudio {
 			if err := processTrack(ctx, referer, &as); err != nil {
+				if err == errChunklistExpired && chunklistRetries < maxChunklistRetries {
+					chunklistRetries++
+					ctx.Logger.Warn("chunklist expired, refreshing",
+						"track", "audio",
+						"attempt", chunklistRetries,
+						"max", maxChunklistRetries,
+					)
+			vURL, aURL, audioExists, refreshErr := fetchAndSelectVariant(ctx, hlsSource, cfg)
+					if refreshErr != nil {
+						ctx.Logger.Error("failed to refresh variant URLs", "error", refreshErr)
+						res.Status = StatusError
+						res.Err = err
+						goto finish
+					}
+					vs.url = vURL
+					vs.wroteInit = false
+					as.url = aURL
+					as.wroteInit = false
+					hasAudio = audioExists
+					if !hasAudio {
+						ctx.Logger.Warn("audio track lost after refresh, continuing with video only")
+					}
+					time.Sleep(time.Duration(chunklistRetries) * time.Second)
+					continue
+				}
 				ctx.Logger.Error("audio track error", "username", cfg.Username, "error", err)
 				res.Status = StatusError
 				res.Err = err
 				goto finish
 			}
+			chunklistRetries = 0
 
 			// Sync check.
 			drift := vs.duration - as.duration
@@ -314,10 +377,14 @@ func fetchAndSelectVariant(ctx *config.AppContext, hlsSource string, cfg config.
 }
 
 // processTrack fetches a chunklist and writes new segments into the pipe writer.
+// Returns errChunklistExpired when the chunklist URL returns 403 (expired).
 func processTrack(ctx *config.AppContext, referer string, ts *trackState) error {
 	resp, err := ctx.Resty.R().SetHeader("Referer", referer).Get(ts.url)
 	if err != nil {
 		return fmt.Errorf("fetch %s chunklist: %w", ts.name, err)
+	}
+	if resp.StatusCode() == 403 {
+		return errChunklistExpired
 	}
 	if resp.StatusCode() != 200 {
 		return fmt.Errorf("%s chunklist HTTP %d", ts.name, resp.StatusCode())
@@ -359,12 +426,16 @@ func processTrack(ctx *config.AppContext, referer string, ts *trackState) error 
 	for _, seg := range newSegments {
 		segURL := resolveURL(ts.url, seg.URI)
 		if err := downloadToWriter(ctx, referer, segURL, ts.writer); err != nil {
-			ctx.Logger.Warn("segment download failed, skipping",
-				"track", ts.name,
-				"seq", seg.SeqId,
-				"error", err,
-			)
-			continue
+			// Retry once after a short delay.
+			time.Sleep(1 * time.Second)
+			if err := downloadToWriter(ctx, referer, segURL, ts.writer); err != nil {
+				ctx.Logger.Warn("segment download failed, skipping",
+					"track", ts.name,
+					"seq", seg.SeqId,
+					"error", err,
+				)
+				continue
+			}
 		}
 		ts.lastSeq = seg.SeqId
 		ts.duration += seg.Duration

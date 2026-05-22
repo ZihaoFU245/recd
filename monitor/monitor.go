@@ -58,7 +58,7 @@ func (m *Monitor) Run() {
 	// Run an immediate tick to check streams without waiting for the first interval.
 	m.tick()
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
 	for {

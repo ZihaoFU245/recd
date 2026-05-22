@@ -62,7 +62,7 @@ func (m *Monitor) checkStreamStatus(username string) (online bool, hlsSource str
 			"viewers", dossier.NumViewers,
 		)
 	} else {
-		m.ctx.Logger.Debug("stream is offline", "username", username, "status", dossier.RoomStatus)
+		m.ctx.Logger.Info("stream is offline", "username", username, "status", dossier.RoomStatus)
 	}
 
 	return online, dossier.HlsSource
