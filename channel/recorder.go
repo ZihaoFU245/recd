@@ -21,6 +21,7 @@ import (
 const (
 	maxDesyncSeconds    = 60.0
 	segmentPollInterval = 300 * time.Millisecond
+	maxInitialAVOffset  = 1 * time.Second
 
 	maxChunklistRetries = 3
 
@@ -39,6 +40,8 @@ type trackState struct {
 	haveLastSeq bool
 	wroteInit   bool
 	duration    float64
+	firstPDT    time.Time
+	lastPDT     time.Time
 	name        string
 }
 
@@ -309,6 +312,13 @@ func recordWithTempFiles(ctx *config.AppContext, cfg config.ChannelConfig, hlsSo
 	defer poll.Stop()
 
 	chunklistRetries := 0
+
+	if err := alignInitialTracks(ctx, referer, &vs, &as); err != nil {
+		ctx.Logger.Error("initial track alignment failed", "username", cfg.Username, "error", err)
+		res.Status = StatusError
+		res.Err = err
+		goto finish
+	}
 
 	for {
 		if err := processTrack(ctx, referer, &vs); err != nil {
@@ -629,6 +639,82 @@ func writeInitSegment(ctx *config.AppContext, referer string, ts *trackState, me
 	return nil
 }
 
+func alignInitialTracks(ctx *config.AppContext, referer string, video, audio *trackState) error {
+	if video.haveLastSeq || audio.haveLastSeq {
+		return nil
+	}
+
+	videoMedia, err := fetchMediaPlaylist(ctx, referer, video)
+	if err != nil {
+		return err
+	}
+	audioMedia, err := fetchMediaPlaylist(ctx, referer, audio)
+	if err != nil {
+		return err
+	}
+
+	videoStart, audioStart, offset, ok := chooseAlignedStart(videoMedia.Segments, audioMedia.Segments)
+	if !ok {
+		ctx.Logger.Warn("initial track program times unavailable, falling back to playlist starts",
+			"video_track", video.name,
+			"audio_track", audio.name,
+		)
+		return nil
+	}
+
+	if offset > maxInitialAVOffset {
+		ctx.Logger.Warn("large initial audio/video program-time offset",
+			"offset", offset,
+			"max_expected", maxInitialAVOffset,
+		)
+	}
+
+	if err := writeInitSegment(ctx, referer, video, videoMedia); err != nil {
+		return err
+	}
+	if err := writeInitSegment(ctx, referer, audio, audioMedia); err != nil {
+		return err
+	}
+
+	ctx.Logger.Info("initial tracks aligned",
+		"video_seq", videoMedia.Segments[videoStart].SeqId,
+		"video_time", videoMedia.Segments[videoStart].ProgramDateTime,
+		"audio_seq", audioMedia.Segments[audioStart].SeqId,
+		"audio_time", audioMedia.Segments[audioStart].ProgramDateTime,
+		"offset", offset,
+	)
+
+	if err := processTrackSegments(ctx, referer, video, videoMedia.Segments[videoStart:]); err != nil {
+		return err
+	}
+	return processTrackSegments(ctx, referer, audio, audioMedia.Segments[audioStart:])
+}
+
+func chooseAlignedStart(videoSegments, audioSegments []*m3u8.MediaSegment) (videoIndex, audioIndex int, offset time.Duration, ok bool) {
+	bestOffset := time.Duration(1<<63 - 1)
+	for vi, vseg := range videoSegments {
+		if vseg == nil || vseg.ProgramDateTime.IsZero() {
+			continue
+		}
+		for ai, aseg := range audioSegments {
+			if aseg == nil || aseg.ProgramDateTime.IsZero() {
+				continue
+			}
+			delta := vseg.ProgramDateTime.Sub(aseg.ProgramDateTime)
+			if delta < 0 {
+				delta = -delta
+			}
+			if delta < bestOffset {
+				bestOffset = delta
+				videoIndex = vi
+				audioIndex = ai
+				ok = true
+			}
+		}
+	}
+	return videoIndex, audioIndex, bestOffset, ok
+}
+
 func processTrack(ctx *config.AppContext, referer string, ts *trackState) error {
 	media, err := fetchMediaPlaylist(ctx, referer, ts)
 	if err != nil {
@@ -637,9 +723,12 @@ func processTrack(ctx *config.AppContext, referer string, ts *trackState) error 
 	if err := writeInitSegment(ctx, referer, ts, media); err != nil {
 		return err
 	}
+	return processTrackSegments(ctx, referer, ts, media.Segments)
+}
 
+func processTrackSegments(ctx *config.AppContext, referer string, ts *trackState, segments []*m3u8.MediaSegment) error {
 	var newSegments []*m3u8.MediaSegment
-	for _, seg := range media.Segments {
+	for _, seg := range segments {
 		if seg == nil {
 			continue
 		}
@@ -662,6 +751,12 @@ func processTrack(ctx *config.AppContext, referer string, ts *trackState) error 
 		ts.lastSeq = seg.SeqId
 		ts.haveLastSeq = true
 		ts.duration += seg.Duration
+		if !seg.ProgramDateTime.IsZero() {
+			if ts.firstPDT.IsZero() {
+				ts.firstPDT = seg.ProgramDateTime
+			}
+			ts.lastPDT = seg.ProgramDateTime
+		}
 	}
 
 	return nil

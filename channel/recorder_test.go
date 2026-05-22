@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"recd/config"
+
+	"github.com/grafov/m3u8"
 )
 
 func TestProcessTrackWritesSequenceZero(t *testing.T) {
@@ -77,6 +79,71 @@ func TestProcessTrackErrorsOnSkippedSequence(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "missed segment") {
 		t.Fatalf("expected missed segment error, got %v", err)
+	}
+}
+
+func TestAlignInitialTracksUsesClosestProgramDateTimes(t *testing.T) {
+	base := time.Date(2026, 5, 22, 14, 10, 0, 0, time.UTC)
+	server := newSegmentServer(map[string][]byte{
+		"/vinit.mp4": []byte("vinit|"),
+		"/ainit.mp4": []byte("ainit|"),
+		"/v100.m4s":  []byte("v100|"),
+		"/v101.m4s":  []byte("v101|"),
+		"/v102.m4s":  []byte("v102|"),
+		"/a200.m4s":  []byte("a200|"),
+		"/a201.m4s":  []byte("a201|"),
+		"/a202.m4s":  []byte("a202|"),
+	})
+
+	server.setPlaylist("/video.m3u8", mediaPlaylistWithTimes(100, "vinit.mp4", []timedSegment{
+		{uri: "v100.m4s", programTime: base},
+		{uri: "v101.m4s", programTime: base.Add(1600 * time.Millisecond)},
+		{uri: "v102.m4s", programTime: base.Add(3200 * time.Millisecond)},
+	}))
+	server.setPlaylist("/audio.m3u8", mediaPlaylistWithTimes(200, "ainit.mp4", []timedSegment{
+		{uri: "a200.m4s", programTime: base.Add(1300 * time.Millisecond)},
+		{uri: "a201.m4s", programTime: base.Add(2900 * time.Millisecond)},
+		{uri: "a202.m4s", programTime: base.Add(4500 * time.Millisecond)},
+	}))
+
+	var videoOut, audioOut bytes.Buffer
+	video := trackState{
+		url:    server.URL + "/video.m3u8",
+		writer: nopWriteCloser{&videoOut},
+		name:   "video",
+	}
+	audio := trackState{
+		url:    server.URL + "/audio.m3u8",
+		writer: nopWriteCloser{&audioOut},
+		name:   "audio",
+	}
+
+	if err := alignInitialTracks(testContextWithTransport(server), "https://chaturbate.com/test/", &video, &audio); err != nil {
+		t.Fatalf("alignInitialTracks() error: %v", err)
+	}
+
+	if got, want := videoOut.String(), "vinit|v101|v102|"; got != want {
+		t.Fatalf("unexpected video output: got %q want %q", got, want)
+	}
+	if got, want := audioOut.String(), "ainit|a200|a201|a202|"; got != want {
+		t.Fatalf("unexpected audio output: got %q want %q", got, want)
+	}
+	if video.firstPDT.Sub(audio.firstPDT) != 300*time.Millisecond {
+		t.Fatalf("unexpected first program time offset: video=%s audio=%s", video.firstPDT, audio.firstPDT)
+	}
+	if video.lastSeq != 102 || audio.lastSeq != 202 {
+		t.Fatalf("unexpected last seq: video=%d audio=%d", video.lastSeq, audio.lastSeq)
+	}
+}
+
+func TestChooseAlignedStartReturnsFalseWithoutProgramDateTimes(t *testing.T) {
+	_, _, _, ok := chooseAlignedStart([]*m3u8.MediaSegment{
+		{SeqId: 1, URI: "v1.m4s"},
+	}, []*m3u8.MediaSegment{
+		{SeqId: 1, URI: "a1.m4s"},
+	})
+	if ok {
+		t.Fatal("expected no alignment without program date times")
 	}
 }
 
@@ -252,6 +319,21 @@ func mediaPlaylistWithMap(seq uint64, init string, segments []string) string {
 	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:%d\n#EXT-X-MAP:URI=\"%s\"\n", seq, init)
 	for _, segment := range segments {
 		fmt.Fprintf(&b, "#EXTINF:1.000000,\n%s\n", segment)
+	}
+	return b.String()
+}
+
+type timedSegment struct {
+	uri         string
+	programTime time.Time
+}
+
+func mediaPlaylistWithTimes(seq uint64, init string, segments []timedSegment) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:%d\n#EXT-X-MAP:URI=\"%s\"\n", seq, init)
+	for _, segment := range segments {
+		fmt.Fprintf(&b, "#EXT-X-PROGRAM-DATE-TIME:%s\n", segment.programTime.Format(time.RFC3339Nano))
+		fmt.Fprintf(&b, "#EXTINF:1.600000,\n%s\n", segment.uri)
 	}
 	return b.String()
 }
