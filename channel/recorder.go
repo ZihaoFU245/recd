@@ -1,6 +1,9 @@
 package channel
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
@@ -42,7 +45,22 @@ type trackState struct {
 	duration    float64
 	firstPDT    time.Time
 	lastPDT     time.Time
+	username    string
 	name        string
+}
+
+type segmentCacheEntry struct {
+	Username        string `json:"username"`
+	Track           string `json:"track"`
+	Kind            string `json:"kind"`
+	Seq             uint64 `json:"seq,omitempty"`
+	URI             string `json:"uri"`
+	URL             string `json:"url"`
+	Path            string `json:"path"`
+	SHA256          string `json:"sha256"`
+	Size            int    `json:"size"`
+	DurationSeconds string `json:"duration_seconds,omitempty"`
+	ProgramDateTime string `json:"program_date_time,omitempty"`
 }
 
 // record starts recording for a channel. Separate audio/video fMP4 variants are
@@ -297,8 +315,8 @@ func recordWithTempFiles(ctx *config.AppContext, cfg config.ChannelConfig, hlsSo
 		audioFile.Close()
 	}()
 
-	vs := trackState{url: videoChunkURL, writer: videoFile, name: "video"}
-	as := trackState{url: audioChunkURL, writer: audioFile, name: "audio"}
+	vs := trackState{url: videoChunkURL, writer: videoFile, username: cfg.Username, name: "video"}
+	as := trackState{url: audioChunkURL, writer: audioFile, username: cfg.Username, name: "audio"}
 
 	ctx.Logger.Info("recording loop started (temp files)",
 		"username", cfg.Username,
@@ -631,8 +649,21 @@ func fetchMediaPlaylist(ctx *config.AppContext, referer string, ts *trackState) 
 func writeInitSegment(ctx *config.AppContext, referer string, ts *trackState, media *m3u8.MediaPlaylist) error {
 	if !ts.wroteInit && media.Map != nil && media.Map.URI != "" {
 		initURL := resolveURL(ts.url, media.Map.URI)
-		if err := downloadToWriter(ctx, referer, initURL, ts.writer); err != nil {
+		body, err := downloadBytes(ctx, referer, initURL)
+		if err != nil {
 			return fmt.Errorf("%s init segment: %w", ts.name, err)
+		}
+		if err := writeAll(ts.writer, body); err != nil {
+			return fmt.Errorf("%s init segment write: %w", ts.name, err)
+		}
+		if err := cacheDownloadedSegment(ts, segmentCacheEntry{
+			Username: ts.username,
+			Track:    ts.name,
+			Kind:     "init",
+			URI:      media.Map.URI,
+			URL:      initURL,
+		}, body); err != nil {
+			return fmt.Errorf("%s init segment cache: %w", ts.name, err)
 		}
 		ts.wroteInit = true
 	}
@@ -745,7 +776,7 @@ func processTrackSegments(ctx *config.AppContext, referer string, ts *trackState
 
 	for _, seg := range newSegments {
 		segURL := resolveURL(ts.url, seg.URI)
-		if err := downloadSegmentWithRetry(ctx, referer, segURL, ts.writer); err != nil {
+		if err := downloadSegmentWithRetry(ctx, referer, ts, seg, segURL); err != nil {
 			return fmt.Errorf("%s segment seq %d: %w", ts.name, seg.SeqId, err)
 		}
 		ts.lastSeq = seg.SeqId
@@ -762,35 +793,140 @@ func processTrackSegments(ctx *config.AppContext, referer string, ts *trackState
 	return nil
 }
 
-func downloadSegmentWithRetry(ctx *config.AppContext, referer, segURL string, w io.Writer) error {
-	err := downloadToWriter(ctx, referer, segURL, w)
+func downloadSegmentWithRetry(ctx *config.AppContext, referer string, ts *trackState, seg *m3u8.MediaSegment, segURL string) error {
+	err := downloadSegment(ctx, referer, ts, seg, segURL)
 	if err == nil {
 		return nil
 	}
 	time.Sleep(1 * time.Second)
-	retryErr := downloadToWriter(ctx, referer, segURL, w)
+	retryErr := downloadSegment(ctx, referer, ts, seg, segURL)
 	if retryErr == nil {
 		return nil
 	}
 	return fmt.Errorf("download failed after retry: %w (initial error: %v)", retryErr, err)
 }
 
+func downloadSegment(ctx *config.AppContext, referer string, ts *trackState, seg *m3u8.MediaSegment, segURL string) error {
+	body, err := downloadBytes(ctx, referer, segURL)
+	if err != nil {
+		return err
+	}
+	if err := writeAll(ts.writer, body); err != nil {
+		return err
+	}
+	entry := segmentCacheEntry{
+		Username:        ts.username,
+		Track:           ts.name,
+		Kind:            "segment",
+		Seq:             seg.SeqId,
+		URI:             seg.URI,
+		URL:             segURL,
+		DurationSeconds: strconv.FormatFloat(seg.Duration, 'f', 6, 64),
+	}
+	if !seg.ProgramDateTime.IsZero() {
+		entry.ProgramDateTime = seg.ProgramDateTime.Format(time.RFC3339Nano)
+	}
+	return cacheDownloadedSegment(ts, entry, body)
+}
+
 func downloadToWriter(ctx *config.AppContext, referer, segURL string, w io.Writer) error {
+	body, err := downloadBytes(ctx, referer, segURL)
+	if err != nil {
+		return err
+	}
+	return writeAll(w, body)
+}
+
+func downloadBytes(ctx *config.AppContext, referer, segURL string) ([]byte, error) {
 	resp, err := ctx.Resty.R().SetHeader("Referer", referer).Get(segURL)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if resp.StatusCode() != 200 {
-		return fmt.Errorf("HTTP %d", resp.StatusCode())
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode())
 	}
-	n, err := w.Write(resp.Body())
+	return resp.Body(), nil
+}
+
+func writeAll(w io.Writer, body []byte) error {
+	n, err := w.Write(body)
 	if err != nil {
 		return err
 	}
-	if n != len(resp.Body()) {
+	if n != len(body) {
 		return io.ErrShortWrite
 	}
 	return nil
+}
+
+func cacheDownloadedSegment(ts *trackState, entry segmentCacheEntry, body []byte) error {
+	cacheRoot := os.Getenv("RECD_SEGMENT_CACHE_DIR")
+	if cacheRoot == "" {
+		return nil
+	}
+
+	username := sanitizePathPart(entry.Username)
+	if username == "" {
+		username = "unknown"
+	}
+	track := sanitizePathPart(entry.Track)
+	if track == "" {
+		track = "track"
+	}
+
+	trackDir := filepath.Join(cacheRoot, username, track)
+	if err := os.MkdirAll(trackDir, 0755); err != nil {
+		return err
+	}
+
+	hash := sha256.Sum256(body)
+	entry.SHA256 = hex.EncodeToString(hash[:])
+	entry.Size = len(body)
+
+	filename := cacheFilename(entry)
+	entry.Path = filepath.Join(trackDir, filename)
+	if err := os.WriteFile(entry.Path, body, 0644); err != nil {
+		return err
+	}
+
+	manifestPath := filepath.Join(cacheRoot, username, "manifest.jsonl")
+	manifestFile, err := os.OpenFile(manifestPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	defer manifestFile.Close()
+
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	if _, err := manifestFile.Write(append(encoded, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+func cacheFilename(entry segmentCacheEntry) string {
+	switch entry.Kind {
+	case "init":
+		return fmt.Sprintf("000000000000_init_%s.m4s", entry.SHA256[:12])
+	case "segment":
+		return fmt.Sprintf("%012d_%s.m4s", entry.Seq, entry.SHA256[:12])
+	default:
+		return fmt.Sprintf("%012d_%s_%s.m4s", entry.Seq, sanitizePathPart(entry.Kind), entry.SHA256[:12])
+	}
+}
+
+func sanitizePathPart(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 func resolveURL(base, uri string) string {

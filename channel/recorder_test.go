@@ -2,6 +2,7 @@ package channel
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -144,6 +145,46 @@ func TestChooseAlignedStartReturnsFalseWithoutProgramDateTimes(t *testing.T) {
 	})
 	if ok {
 		t.Fatal("expected no alignment without program date times")
+	}
+}
+
+func TestCacheDownloadedSegmentWritesBodyAndManifest(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("RECD_SEGMENT_CACHE_DIR", cacheDir)
+
+	body := []byte("segment-body")
+	entry := segmentCacheEntry{
+		Username:        "user/name",
+		Track:           "video",
+		Kind:            "segment",
+		Seq:             42,
+		URI:             "seg.m4s",
+		URL:             "https://segments.test/seg.m4s",
+		DurationSeconds: "1.600000",
+		ProgramDateTime: time.Date(2026, 5, 23, 1, 2, 3, 0, time.UTC).Format(time.RFC3339Nano),
+	}
+	if err := cacheDownloadedSegment(&trackState{}, entry, body); err != nil {
+		t.Fatalf("cacheDownloadedSegment() error: %v", err)
+	}
+
+	manifestPath := filepath.Join(cacheDir, "user_name", "manifest.jsonl")
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var got segmentCacheEntry
+	if err := json.Unmarshal(bytes.TrimSpace(manifestData), &got); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	if got.Seq != 42 || got.Track != "video" || got.Kind != "segment" || got.Size != len(body) || got.SHA256 == "" {
+		t.Fatalf("unexpected manifest entry: %+v", got)
+	}
+	cachedBody, err := os.ReadFile(got.Path)
+	if err != nil {
+		t.Fatalf("read cached segment: %v", err)
+	}
+	if !bytes.Equal(cachedBody, body) {
+		t.Fatalf("cached body mismatch: got %q want %q", cachedBody, body)
 	}
 }
 
