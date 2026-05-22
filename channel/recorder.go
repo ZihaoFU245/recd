@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -21,18 +20,13 @@ const (
 	maxDesyncSeconds    = 60.0
 	segmentPollInterval = 800 * time.Millisecond
 
-	// maxChunklistRetries is the number of times we re-fetch the master
-	// playlist to get a fresh chunklist URL before giving up.
 	maxChunklistRetries = 3
 )
 
 var (
-	// errChunklistExpired is returned by processTrack when the chunklist URL
-	// returns 403 (expired). The caller should refresh the master playlist.
 	errChunklistExpired = fmt.Errorf("chunklist expired")
 )
 
-// trackState holds the state for a single media track during recording.
 type trackState struct {
 	url       string
 	writer    io.WriteCloser
@@ -42,9 +36,10 @@ type trackState struct {
 	name      string
 }
 
-// record starts a long-running ffmpeg process that reads video (+ optional audio)
-// from OS pipes and writes a single MKV output file continuously.
-// Segments are downloaded and fed directly into the pipes — no temp files.
+// record starts recording for a channel. For streams with muxed audio (newer
+// mpegts format), video segments are piped to ffmpeg directly. For streams
+// with separate audio (older fMP4 format), video and audio segments are
+// accumulated in temp files and merged with ffmpeg at the end.
 func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 	stopCh <-chan struct{}, reloadCh <-chan struct{}) (res Result) {
 	res.Username = cfg.Username
@@ -66,7 +61,6 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 		}
 	}
 
-	// Fetch master playlist and select the appropriate variant.
 	videoChunkURL, audioChunkURL, hasAudio, err := fetchAndSelectVariant(ctx, hlsSource, cfg)
 	if err != nil {
 		res.Status = StatusError
@@ -76,56 +70,38 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 
 	referer := fmt.Sprintf("https://chaturbate.com/%s/", cfg.Username)
 
-	// Create OS pipes. If no separate audio track, only video pipe is used.
+	if hasAudio {
+		return recordWithTempFiles(ctx, cfg, hlsSource, videoChunkURL, audioChunkURL, referer, outputPath, t0, stopCh, reloadCh)
+	}
+	return recordWithPipe(ctx, cfg, hlsSource, videoChunkURL, referer, outputPath, t0, stopCh, reloadCh)
+}
+
+// recordWithPipe streams video segments through a single OS pipe to ffmpeg.
+// Used for the newer mpegts format where audio is already muxed in.
+func recordWithPipe(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource, videoChunkURL, referer, outputPath string, t0 time.Time, stopCh, reloadCh <-chan struct{}) (res Result) {
+	res.Username = cfg.Username
+
 	vRead, vWrite, err := os.Pipe()
 	if err != nil {
 		res.Status = StatusError
-		res.Err = fmt.Errorf("create video pipe: %w", err)
+		res.Err = fmt.Errorf("create pipe: %w", err)
 		return
 	}
 	defer vWrite.Close()
 	defer vRead.Close()
 
-	var aRead, aWrite *os.File
-	if hasAudio {
-		aRead, aWrite, err = os.Pipe()
-		if err != nil {
-			res.Status = StatusError
-			res.Err = fmt.Errorf("create audio pipe: %w", err)
-			return
-		}
-		defer aWrite.Close()
-		defer aRead.Close()
-	}
-
-	// Build ffmpeg command. With separate audio: two inputs, otherwise one.
-	var ffCmd *exec.Cmd
-	if hasAudio {
-		ffCmd = exec.Command("ffmpeg",
-			"-i", "pipe:3",
-			"-i", "pipe:4",
-			"-c", "copy",
-			"-f", "matroska",
-			outputPath,
-			"-y",
-		)
-		ffCmd.ExtraFiles = []*os.File{vRead, aRead}
-	} else {
-		ffCmd = exec.Command("ffmpeg",
-			"-i", "pipe:3",
-			"-c", "copy",
-			"-f", "matroska",
-			outputPath,
-			"-y",
-		)
-		ffCmd.ExtraFiles = []*os.File{vRead}
-	}
-	ffCmd.Stderr = os.Stderr
+	ffCmd := exec.Command("ffmpeg",
+		"-i", "pipe:3",
+		"-c", "copy",
+		"-f", "matroska",
+		outputPath,
+		"-y",
+	)
+	ffCmd.ExtraFiles = []*os.File{vRead}
 
 	ctx.Logger.Info("starting ffmpeg muxer",
 		"username", cfg.Username,
 		"output", outputPath,
-		"has_audio", hasAudio,
 	)
 	if err := ffCmd.Start(); err != nil {
 		res.Status = StatusError
@@ -137,7 +113,6 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 	go func() { ffDone <- ffCmd.Wait() }()
 
 	vs := trackState{url: videoChunkURL, writer: vWrite, name: "video"}
-	as := trackState{url: audioChunkURL, writer: aWrite, name: "audio"}
 
 	ctx.Logger.Info("recording loop started",
 		"username", cfg.Username,
@@ -148,20 +123,17 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 	poll := time.NewTicker(segmentPollInterval)
 	defer poll.Stop()
 
-	// Track consecutive chunklist errors for retry backoff.
 	chunklistRetries := 0
 
 	for {
-		// Process video track every cycle.
 		if err := processTrack(ctx, referer, &vs); err != nil {
 			if err == errChunklistExpired && chunklistRetries < maxChunklistRetries {
 				chunklistRetries++
 				ctx.Logger.Warn("chunklist expired, refreshing",
-					"track", "video",
 					"attempt", chunklistRetries,
 					"max", maxChunklistRetries,
 				)
-				vURL, aURL, _, refreshErr := fetchAndSelectVariant(ctx, hlsSource, cfg)
+				vURL, _, _, refreshErr := fetchAndSelectVariant(ctx, hlsSource, cfg)
 				if refreshErr != nil {
 					ctx.Logger.Error("failed to refresh variant URLs", "error", refreshErr)
 					res.Status = StatusError
@@ -170,10 +142,6 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 				}
 				vs.url = vURL
 				vs.wroteInit = false
-				if hasAudio {
-					as.url = aURL
-					as.wroteInit = false
-				}
 				time.Sleep(time.Duration(chunklistRetries) * time.Second)
 				continue
 			}
@@ -182,59 +150,8 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 			res.Err = err
 			goto finish
 		}
-		chunklistRetries = 0 // reset on success
+		chunklistRetries = 0
 
-		// Process audio track only if we have a separate audio stream.
-		if hasAudio {
-			if err := processTrack(ctx, referer, &as); err != nil {
-				if err == errChunklistExpired && chunklistRetries < maxChunklistRetries {
-					chunklistRetries++
-					ctx.Logger.Warn("chunklist expired, refreshing",
-						"track", "audio",
-						"attempt", chunklistRetries,
-						"max", maxChunklistRetries,
-					)
-			vURL, aURL, audioExists, refreshErr := fetchAndSelectVariant(ctx, hlsSource, cfg)
-					if refreshErr != nil {
-						ctx.Logger.Error("failed to refresh variant URLs", "error", refreshErr)
-						res.Status = StatusError
-						res.Err = err
-						goto finish
-					}
-					vs.url = vURL
-					vs.wroteInit = false
-					as.url = aURL
-					as.wroteInit = false
-					hasAudio = audioExists
-					if !hasAudio {
-						ctx.Logger.Warn("audio track lost after refresh, continuing with video only")
-					}
-					time.Sleep(time.Duration(chunklistRetries) * time.Second)
-					continue
-				}
-				ctx.Logger.Error("audio track error", "username", cfg.Username, "error", err)
-				res.Status = StatusError
-				res.Err = err
-				goto finish
-			}
-			chunklistRetries = 0
-
-			// Sync check.
-			drift := vs.duration - as.duration
-			if drift < 0 {
-				drift = -drift
-			}
-			if drift > maxDesyncSeconds {
-				err := fmt.Errorf("audio/video desync: video=%.1fs audio=%.1fs drift=%.1fs",
-					vs.duration, as.duration, drift)
-				ctx.Logger.Error("desync detected", "username", cfg.Username, "error", err)
-				res.Status = StatusDesync
-				res.Err = err
-				goto finish
-			}
-		}
-
-		// Duration limit (max_duration is in minutes).
 		if cfg.MaxDuration > 0 && time.Since(t0).Seconds() >= float64(cfg.MaxDuration*60) {
 			ctx.Logger.Info("max duration reached",
 				"username", cfg.Username,
@@ -245,7 +162,6 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 			goto finish
 		}
 
-		// File size limit: check the growing output file.
 		if cfg.MaxFilesize > 0 {
 			if fi, err := os.Stat(outputPath); err == nil && fi.Size() >= cfg.MaxFilesize {
 				ctx.Logger.Info("max filesize reached",
@@ -258,7 +174,6 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 			}
 		}
 
-		// Check if ffmpeg process died unexpectedly.
 		select {
 		case ffErr := <-ffDone:
 			ctx.Logger.Error("ffmpeg exited unexpectedly",
@@ -287,9 +202,6 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 
 finish:
 	vWrite.Close()
-	if hasAudio {
-		aWrite.Close()
-	}
 
 	ctx.Logger.Info("waiting for ffmpeg to finalize", "username", cfg.Username)
 	if ffCmd.ProcessState == nil || !ffCmd.ProcessState.Exited() {
@@ -317,9 +229,202 @@ finish:
 	return
 }
 
-// fetchAndSelectVariant downloads the master m3u8 playlist, selects the
-// video variant closest to the desired resolution, and returns chunklist URLs.
-// hasAudio is false when the stream has audio muxed into the video track.
+// recordWithTempFiles downloads video and audio fMP4 segments into separate
+// temp files, then merges them into a single MKV at the end. Used for the
+// older format where audio is a separate variant.
+func recordWithTempFiles(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource, videoChunkURL, audioChunkURL, referer, outputPath string, t0 time.Time, stopCh, reloadCh <-chan struct{}) (res Result) {
+	res.Username = cfg.Username
+
+	videoFile, err := os.CreateTemp("", "rec_video_*.bin")
+	if err != nil {
+		res.Status = StatusError
+		res.Err = fmt.Errorf("create video temp file: %w", err)
+		return
+	}
+	videoPath := videoFile.Name()
+	defer func() {
+		videoFile.Close()
+		os.Remove(videoPath)
+	}()
+
+	audioFile, err := os.CreateTemp("", "rec_audio_*.bin")
+	if err != nil {
+		res.Status = StatusError
+		res.Err = fmt.Errorf("create audio temp file: %w", err)
+		return
+	}
+	audioPath := audioFile.Name()
+	defer func() {
+		audioFile.Close()
+		os.Remove(audioPath)
+	}()
+
+	vs := trackState{url: videoChunkURL, writer: videoFile, name: "video"}
+	as := trackState{url: audioChunkURL, writer: audioFile, name: "audio"}
+
+	ctx.Logger.Info("recording loop started (temp files)",
+		"username", cfg.Username,
+		"resolution", cfg.Resolution,
+		"output", outputPath,
+		"video_tmp", videoPath,
+		"audio_tmp", audioPath,
+	)
+
+	poll := time.NewTicker(segmentPollInterval)
+	defer poll.Stop()
+
+	chunklistRetries := 0
+
+	for {
+		if err := processTrack(ctx, referer, &vs); err != nil {
+			if err == errChunklistExpired && chunklistRetries < maxChunklistRetries {
+				chunklistRetries++
+				ctx.Logger.Warn("chunklist expired, refreshing",
+					"track", "video",
+					"attempt", chunklistRetries,
+					"max", maxChunklistRetries,
+				)
+				vURL, aURL, _, refreshErr := fetchAndSelectVariant(ctx, hlsSource, cfg)
+				if refreshErr != nil {
+					ctx.Logger.Error("failed to refresh variant URLs", "error", refreshErr)
+					res.Status = StatusError
+					res.Err = err
+					goto finish
+				}
+				vs.url = vURL
+				vs.wroteInit = false
+				as.url = aURL
+				as.wroteInit = false
+				time.Sleep(time.Duration(chunklistRetries) * time.Second)
+				continue
+			}
+			ctx.Logger.Error("video track error", "username", cfg.Username, "error", err)
+			res.Status = StatusError
+			res.Err = err
+			goto finish
+		}
+		chunklistRetries = 0
+
+		if err := processTrack(ctx, referer, &as); err != nil {
+			if err == errChunklistExpired && chunklistRetries < maxChunklistRetries {
+				chunklistRetries++
+				ctx.Logger.Warn("chunklist expired, refreshing",
+					"track", "audio",
+					"attempt", chunklistRetries,
+					"max", maxChunklistRetries,
+				)
+				vURL, aURL, _, refreshErr := fetchAndSelectVariant(ctx, hlsSource, cfg)
+				if refreshErr != nil {
+					ctx.Logger.Error("failed to refresh variant URLs", "error", refreshErr)
+					res.Status = StatusError
+					res.Err = err
+					goto finish
+				}
+				vs.url = vURL
+				vs.wroteInit = false
+				as.url = aURL
+				as.wroteInit = false
+				time.Sleep(time.Duration(chunklistRetries) * time.Second)
+				continue
+			}
+			ctx.Logger.Error("audio track error", "username", cfg.Username, "error", err)
+			res.Status = StatusError
+			res.Err = err
+			goto finish
+		}
+		chunklistRetries = 0
+
+		drift := vs.duration - as.duration
+		if drift < 0 {
+			drift = -drift
+		}
+		if drift > maxDesyncSeconds {
+			err := fmt.Errorf("audio/video desync: video=%.1fs audio=%.1fs drift=%.1fs",
+				vs.duration, as.duration, drift)
+			ctx.Logger.Error("desync detected", "username", cfg.Username, "error", err)
+			res.Status = StatusDesync
+			res.Err = err
+			goto finish
+		}
+
+		if cfg.MaxDuration > 0 && time.Since(t0).Seconds() >= float64(cfg.MaxDuration*60) {
+			ctx.Logger.Info("max duration reached",
+				"username", cfg.Username,
+				"duration", time.Since(t0),
+				"limit_minutes", cfg.MaxDuration,
+			)
+			res.Status = StatusMaxDuration
+			goto finish
+		}
+
+		select {
+		case <-stopCh:
+			ctx.Logger.Info("recording stopped by monitor", "username", cfg.Username)
+			res.Status = StatusCompleted
+			goto finish
+		case <-reloadCh:
+			ctx.Logger.Info("recording reload triggered", "username", cfg.Username)
+			res.Status = StatusCompleted
+			res.Reloaded = true
+			goto finish
+		case <-poll.C:
+		}
+	}
+
+finish:
+	videoFile.Close()
+	audioFile.Close()
+
+	ctx.Logger.Info("merging video and audio",
+		"username", cfg.Username,
+		"output", outputPath,
+		"video_size", mustFileSize(videoPath),
+		"audio_size", mustFileSize(audioPath),
+	)
+
+	mergeCmd := exec.Command("ffmpeg",
+		"-i", videoPath,
+		"-i", audioPath,
+		"-map", "0:v",
+		"-map", "1:a",
+		"-c", "copy",
+		"-f", "matroska",
+		outputPath,
+		"-y",
+	)
+	mergeCmd.Stderr = os.Stderr
+	if err := mergeCmd.Run(); err != nil {
+		ctx.Logger.Error("merge failed", "username", cfg.Username, "error", err)
+		res.Status = StatusError
+		res.Err = fmt.Errorf("merge: %w", err)
+		return // defer will clean up temps
+	}
+
+	if fi, err := os.Stat(outputPath); err == nil {
+		res.Filesize = fi.Size()
+	}
+	res.Duration = time.Since(t0)
+	res.Path = outputPath
+
+	ctx.Logger.Info("recording finalized",
+		"username", cfg.Username,
+		"path", outputPath,
+		"size", res.Filesize,
+		"duration", res.Duration,
+		"status", res.Status,
+	)
+	return
+}
+
+// mustFileSize returns the file size in bytes, or 0 on error.
+func mustFileSize(path string) int64 {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
 func fetchAndSelectVariant(ctx *config.AppContext, hlsSource string, cfg config.ChannelConfig) (
 	videoURL, audioURL string, hasAudio bool, err error,
 ) {
@@ -343,7 +448,6 @@ func fetchAndSelectVariant(ctx *config.AppContext, hlsSource string, cfg config.
 
 	master := playlist.(*m3u8.MasterPlaylist)
 
-	// Select video variant closest to the desired resolution height.
 	targetHeight := cfg.Resolution
 	var best *m3u8.Variant
 	bestDist := 99999
@@ -370,20 +474,16 @@ func fetchAndSelectVariant(ctx *config.AppContext, hlsSource string, cfg config.
 	}
 	videoURL = resolveURL(hlsSource, best.URI)
 
-	// Check for separate audio via #EXT-X-MEDIA tags.
-	reAudio := regexp.MustCompile(`#EXT-X-MEDIA:[^\n]*TYPE=AUDIO[^\n]*URI="([^"]+)"`)
-	audioMatch := reAudio.FindStringSubmatch(body)
-	if len(audioMatch) >= 2 {
-		audioURL = resolveURL(hlsSource, audioMatch[1])
-		return videoURL, audioURL, true, nil
+	for _, alt := range best.Alternatives {
+		if alt != nil && alt.Type == "AUDIO" && alt.GroupId == best.Audio && alt.URI != "" {
+			audioURL = resolveURL(hlsSource, alt.URI)
+			return videoURL, audioURL, true, nil
+		}
 	}
 
-	// No separate audio track; audio is muxed into the video variant.
 	return videoURL, "", false, nil
 }
 
-// processTrack fetches a chunklist and writes new segments into the pipe writer.
-// Returns errChunklistExpired when the chunklist URL returns 403 (expired).
 func processTrack(ctx *config.AppContext, referer string, ts *trackState) error {
 	resp, err := ctx.Resty.R().SetHeader("Referer", referer).Get(ts.url)
 	if err != nil {
@@ -406,7 +506,6 @@ func processTrack(ctx *config.AppContext, referer string, ts *trackState) error 
 
 	media := playlist.(*m3u8.MediaPlaylist)
 
-	// Write init segment once.
 	if !ts.wroteInit && media.Map != nil && media.Map.URI != "" {
 		initURL := resolveURL(ts.url, media.Map.URI)
 		if err := downloadToWriter(ctx, referer, initURL, ts.writer); err != nil {
@@ -415,7 +514,6 @@ func processTrack(ctx *config.AppContext, referer string, ts *trackState) error 
 		ts.wroteInit = true
 	}
 
-	// Find and write new segments in sequence order.
 	var newSegments []*m3u8.MediaSegment
 	for _, seg := range media.Segments {
 		if seg == nil {
@@ -432,7 +530,6 @@ func processTrack(ctx *config.AppContext, referer string, ts *trackState) error 
 	for _, seg := range newSegments {
 		segURL := resolveURL(ts.url, seg.URI)
 		if err := downloadToWriter(ctx, referer, segURL, ts.writer); err != nil {
-			// Retry once after a short delay.
 			time.Sleep(1 * time.Second)
 			if err := downloadToWriter(ctx, referer, segURL, ts.writer); err != nil {
 				ctx.Logger.Warn("segment download failed, skipping",
@@ -450,7 +547,6 @@ func processTrack(ctx *config.AppContext, referer string, ts *trackState) error 
 	return nil
 }
 
-// downloadToWriter fetches a URL and writes the response body to w.
 func downloadToWriter(ctx *config.AppContext, referer, segURL string, w io.Writer) error {
 	resp, err := ctx.Resty.R().SetHeader("Referer", referer).Get(segURL)
 	if err != nil {
@@ -463,7 +559,6 @@ func downloadToWriter(ctx *config.AppContext, referer, segURL string, w io.Write
 	return err
 }
 
-// resolveURL resolves a relative URI against a base URL using proper URL resolution.
 func resolveURL(base, uri string) string {
 	if strings.HasPrefix(uri, "http") {
 		return uri
