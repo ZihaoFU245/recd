@@ -193,3 +193,74 @@ Then `json.Unmarshal` the result.
 - Use the Chrome UA from AGENTS.md
 - Always include `Referer: https://chaturbate.com/{username}/`
 - Respect the CDN edge region (don't hardcode edge hostname)
+
+---
+
+## 7. Worker Recorder Process
+
+The worker side is the `channel` package. The monitor starts one `Channel`
+goroutine per online target, and that goroutine owns exactly one recording
+session for the configured username.
+
+### Lifecycle
+
+1. `monitor.startChannelLocked` creates `channel.New(ctx, cfg, hlsSource, resultCh)`.
+2. `Channel.Run` marks the channel active and calls `record(...)`.
+3. `record` chooses a non-conflicting output path from the configured pattern,
+   fetches the master playlist from `hls_source`, selects the closest video
+   variant to `cfg.Resolution`, and checks whether the selected variant has a
+   separate audio rendition.
+4. The recorder runs one of two capture paths:
+   - `recordWithFFmpegHLS` for a single HLS media playlist. `ffmpeg` reads the
+     playlist directly with the required UA and `Referer` headers and remuxes to
+     MKV with `-c copy`.
+   - `recordWithTempFiles` for separate audio/video fMP4 playlists. The worker
+     polls both media playlists, downloads only unseen segments, writes each
+     track to a temp file, then merges the temp video/audio files into the final
+     MKV with `ffmpeg`.
+5. When recording ends, `Channel.Run` sends a `Result` back to the monitor.
+   Normal end states are `completed`, `max_duration`, and `max_filesize`.
+   Unexpected recorder failures use `error`; excessive audio/video drift uses
+   `desync`.
+
+### Stop and Reload
+
+- `Channel.Stop` closes `stopCh`. The worker exits gracefully, finalizes any
+  mergeable media, and returns `StatusCompleted`.
+- `Channel.Reload` sends a non-blocking signal on `reloadCh`. The worker exits
+  with `Reloaded=true` so the monitor does not delete or retry a newly spawned
+  replacement channel.
+- Initial master-playlist fetching is cancellable. If the monitor stops or
+  reloads while that HTTP request is in flight, the request context is canceled
+  and the worker exits instead of hanging inside Resty.
+
+### Segment Handling
+
+- Each `trackState` stores the media playlist URL, output writer, last sequence
+  number, init-segment state, cumulative duration, and first/last
+  `EXT-X-PROGRAM-DATE-TIME`.
+- `alignInitialTracks` uses program date times to choose the closest initial
+  audio/video segment pair before any bytes are written. This reduces startup
+  A/V offset for separate tracks.
+- `processTrackSegments` skips already-recorded sequence numbers and errors if
+  the next visible sequence jumps ahead, because that means the LL-HLS sliding
+  window moved before the worker downloaded all segments.
+- Optional segment caching is controlled by `RECD_SEGMENT_CACHE_DIR`; when set,
+  downloaded init segments and media segments are written with a JSONL manifest
+  containing track, sequence, URI, size, hash, duration, and program time.
+
+### Bugs Fixed in This Pass
+
+- Shared Resty clients now use the required Chrome User-Agent by default, while
+  still allowing `--additional-headers` to override it.
+- Resty now has a finite timeout, and monitor stream-status checks are
+  cancellable on shutdown.
+- Channel startup no longer hangs forever if `Stop` or `Reload` happens during
+  the initial master-playlist request.
+- Recorder output paths now use the existing `.Sequence` template variable when
+  the base output file already exists, avoiding accidental overwrites on quick
+  respawns.
+- The temp-file merge command now passes `-y` before the output path.
+- Removed the unused `downloadToWriter` helper.
+- The real-segment verifier no longer requires a missing `headers.json` file;
+  the application default UA now covers that requirement.

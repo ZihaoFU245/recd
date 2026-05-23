@@ -1,9 +1,11 @@
 package channel
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -27,8 +29,7 @@ const (
 	maxInitialAVOffset  = 1 * time.Second
 
 	maxChunklistRetries = 3
-
-	defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+	maxOutputPathTries  = 10000
 )
 
 var (
@@ -63,6 +64,11 @@ type segmentCacheEntry struct {
 	ProgramDateTime string `json:"program_date_time,omitempty"`
 }
 
+type recorderSignal struct {
+	status   Status
+	reloaded bool
+}
+
 // record starts recording for a channel. Separate audio/video fMP4 variants are
 // downloaded into temp files and merged by ffmpeg with source timestamps
 // preserved. Single-stream variants are handed to ffmpeg's HLS demuxer.
@@ -71,13 +77,12 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 	res.Username = cfg.Username
 
 	t0 := time.Now()
-	outputPath, err := config.ExpandPattern(cfg.Pattern, config.PathVars(cfg.Username, t0, 0))
+	outputPath, err := nextOutputPath(cfg.Pattern, cfg.Username, t0)
 	if err != nil {
 		res.Status = StatusError
-		res.Err = fmt.Errorf("pattern expansion: %w", err)
+		res.Err = err
 		return
 	}
-	outputPath += ".mkv"
 
 	if dir := filepath.Dir(outputPath); dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -87,7 +92,15 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 		}
 	}
 
-	videoChunkURL, audioChunkURL, hasAudio, err := fetchAndSelectVariant(ctx, hlsSource, cfg)
+	reqCtx, finishInitialRequest := watchRecorderSignals(stopCh, reloadCh)
+	videoChunkURL, audioChunkURL, hasAudio, err := fetchAndSelectVariant(reqCtx, ctx, hlsSource, cfg)
+	if sig, ok := finishInitialRequest(); ok {
+		res.Status = sig.status
+		res.Reloaded = sig.reloaded
+		res.Duration = time.Since(t0)
+		res.Path = outputPath
+		return
+	}
 	if err != nil {
 		res.Status = StatusError
 		res.Err = fmt.Errorf("variant selection: %w", err)
@@ -100,6 +113,52 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string,
 		return recordWithTempFiles(ctx, cfg, hlsSource, videoChunkURL, audioChunkURL, referer, outputPath, t0, stopCh, reloadCh)
 	}
 	return recordWithFFmpegHLS(ctx, cfg, videoChunkURL, audioChunkURL, hasAudio, referer, outputPath, t0, stopCh, reloadCh)
+}
+
+func nextOutputPath(pattern, username string, start time.Time) (string, error) {
+	for seq := 0; seq < maxOutputPathTries; seq++ {
+		path, err := config.ExpandPattern(pattern, config.PathVars(username, start, seq))
+		if err != nil {
+			return "", fmt.Errorf("pattern expansion: %w", err)
+		}
+		path += ".mkv"
+
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			return path, nil
+		} else if err != nil {
+			return "", fmt.Errorf("stat output path %s: %w", path, err)
+		}
+	}
+	return "", fmt.Errorf("no available output path after %d attempts", maxOutputPathTries)
+}
+
+func watchRecorderSignals(stopCh, reloadCh <-chan struct{}) (context.Context, func() (recorderSignal, bool)) {
+	reqCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	sigCh := make(chan recorderSignal, 1)
+
+	go func() {
+		select {
+		case <-stopCh:
+			sigCh <- recorderSignal{status: StatusCompleted}
+			cancel()
+		case <-reloadCh:
+			sigCh <- recorderSignal{status: StatusCompleted, reloaded: true}
+			cancel()
+		case <-done:
+		}
+	}()
+
+	return reqCtx, func() (recorderSignal, bool) {
+		close(done)
+		cancel()
+		select {
+		case sig := <-sigCh:
+			return sig, true
+		default:
+			return recorderSignal{}, false
+		}
+	}
 }
 
 func recordWithFFmpegHLS(ctx *config.AppContext, cfg config.ChannelConfig, videoChunkURL, audioChunkURL string, hasAudio bool, referer, outputPath string, t0 time.Time, stopCh, reloadCh <-chan struct{}) (res Result) {
@@ -246,7 +305,7 @@ func ffmpegUserAgent(ctx *config.AppContext) string {
 	if ctx != nil && ctx.Headers != nil && ctx.Headers["User-Agent"] != "" {
 		return ctx.Headers["User-Agent"]
 	}
-	return defaultUserAgent
+	return config.DefaultUserAgent
 }
 
 func ffmpegHeaders(ctx *config.AppContext, referer string) string {
@@ -347,7 +406,7 @@ func recordWithTempFiles(ctx *config.AppContext, cfg config.ChannelConfig, hlsSo
 					"attempt", chunklistRetries,
 					"max", maxChunklistRetries,
 				)
-				vURL, aURL, _, refreshErr := fetchAndSelectVariant(ctx, hlsSource, cfg)
+				vURL, aURL, _, refreshErr := fetchAndSelectVariant(context.Background(), ctx, hlsSource, cfg)
 				if refreshErr != nil {
 					ctx.Logger.Error("failed to refresh variant URLs", "error", refreshErr)
 					res.Status = StatusError
@@ -376,7 +435,7 @@ func recordWithTempFiles(ctx *config.AppContext, cfg config.ChannelConfig, hlsSo
 					"attempt", chunklistRetries,
 					"max", maxChunklistRetries,
 				)
-				vURL, aURL, _, refreshErr := fetchAndSelectVariant(ctx, hlsSource, cfg)
+				vURL, aURL, _, refreshErr := fetchAndSelectVariant(context.Background(), ctx, hlsSource, cfg)
 				if refreshErr != nil {
 					ctx.Logger.Error("failed to refresh variant URLs", "error", refreshErr)
 					res.Status = StatusError
@@ -532,8 +591,8 @@ func mergeTempFiles(ctx *config.AppContext, username, videoPath, audioPath, outp
 		"-map", "1:a",
 		"-c", "copy",
 		"-f", "matroska",
-		outputPath,
 		"-y",
+		outputPath,
 	)
 	mergeCmd.Stderr = os.Stderr
 	if err := mergeCmd.Run(); err != nil {
@@ -563,11 +622,14 @@ func mustFileSize(path string) int64 {
 	return fi.Size()
 }
 
-func fetchAndSelectVariant(ctx *config.AppContext, hlsSource string, cfg config.ChannelConfig) (
+func fetchAndSelectVariant(reqCtx context.Context, ctx *config.AppContext, hlsSource string, cfg config.ChannelConfig) (
 	videoURL, audioURL string, hasAudio bool, err error,
 ) {
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
 	referer := fmt.Sprintf("https://chaturbate.com/%s/", cfg.Username)
-	resp, err := ctx.Resty.R().SetHeader("Referer", referer).Get(hlsSource)
+	resp, err := ctx.Resty.R().SetContext(reqCtx).SetHeader("Referer", referer).Get(hlsSource)
 	if err != nil {
 		return "", "", false, fmt.Errorf("fetch master playlist: %w", err)
 	}
@@ -827,14 +889,6 @@ func downloadSegment(ctx *config.AppContext, referer string, ts *trackState, seg
 		entry.ProgramDateTime = seg.ProgramDateTime.Format(time.RFC3339Nano)
 	}
 	return cacheDownloadedSegment(ts, entry, body)
-}
-
-func downloadToWriter(ctx *config.AppContext, referer, segURL string, w io.Writer) error {
-	body, err := downloadBytes(ctx, referer, segURL)
-	if err != nil {
-		return err
-	}
-	return writeAll(w, body)
 }
 
 func downloadBytes(ctx *config.AppContext, referer, segURL string) ([]byte, error) {

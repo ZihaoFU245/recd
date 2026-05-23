@@ -166,8 +166,6 @@ def run_recorder(repo, binary, usernames, resolution, duration, work, cache_root
     cmd = [
         str(binary),
         "--log-level=info",
-        "--additional-headers",
-        "headers.json",
         "--pid-file",
         str(pid_path),
         str(config_path),

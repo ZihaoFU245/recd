@@ -2,3 +2,5 @@
 videos/
 recd
 *.log
+*.pyc
+__pycache__/

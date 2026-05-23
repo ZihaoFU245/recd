@@ -1,8 +1,15 @@
 package monitor
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,7 +19,38 @@ import (
 
 func testContext() *config.AppContext {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	return config.NewAppContext(logger, nil)
+	ctx := config.NewAppContext(logger, nil)
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return response(req, 200, "text/html", []byte(roomDossierHTML(config.RoomDossier{
+			RoomStatus:          "offline",
+			HlsSource:           "",
+			BroadcasterUsername: strings.Trim(req.URL.Path, "/"),
+			NumViewers:          0,
+		}))), nil
+	}))
+	return ctx
+}
+
+func TestMonitorStopCancelsStreamStatusCheck(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	ctx := config.NewAppContext(logger, nil)
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	}))
+	mon := New(ctx, []config.ChannelConfig{
+		{IsPaused: false, Username: "slow_user"},
+	})
+
+	go mon.Run()
+	time.Sleep(10 * time.Millisecond)
+	mon.Stop()
+
+	select {
+	case <-mon.Done():
+	case <-time.After(time.Second):
+		t.Fatal("monitor Run() did not return after Stop() canceled stream check")
+	}
 }
 
 func TestMonitorLifecycle(t *testing.T) {
@@ -255,4 +293,29 @@ func TestMonitorHandleResult_Reloaded(t *testing.T) {
 	if _, waiting := mon.respawnAfter["stale"]; waiting {
 		t.Error("expected no retry for reloaded result")
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func response(req *http.Request, status int, contentType string, body []byte) *http.Response {
+	header := make(http.Header)
+	header.Set("Content-Type", contentType)
+	return &http.Response{
+		StatusCode:    status,
+		Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}
+}
+
+func roomDossierHTML(dossier config.RoomDossier) string {
+	payload, _ := json.Marshal(dossier)
+	escaped := strings.Trim(strconv.Quote(string(payload)), `"`)
+	return `<script>window.initialRoomDossier = "` + escaped + `";</script>`
 }

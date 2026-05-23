@@ -20,6 +20,7 @@ type Monitor struct {
 	configs  []config.ChannelConfig
 	channels map[string]*channel.Channel
 	mu       sync.Mutex
+	stopOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
 
@@ -276,7 +277,9 @@ func (m *Monitor) shutdownAllChannels() {
 }
 
 func (m *Monitor) Stop() {
-	close(m.stopCh)
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
+	})
 }
 
 func (m *Monitor) Done() <-chan struct{} {

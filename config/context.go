@@ -2,9 +2,12 @@ package config
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/go-resty/resty/v2"
 )
+
+const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 
 type AppContext struct {
 	Resty   *resty.Client
@@ -13,7 +16,9 @@ type AppContext struct {
 }
 
 func NewAppContext(logger *slog.Logger, headers map[string]string) *AppContext {
-	client := resty.New()
+	client := resty.New().
+		SetHeader("User-Agent", DefaultUserAgent).
+		SetTimeout(30 * time.Second)
 	if headers != nil {
 		client.SetHeaders(headers)
 	}

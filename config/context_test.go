@@ -26,6 +26,9 @@ func TestAppContext(t *testing.T) {
 	if ctx.Headers["User-Agent"] != "TestAgent/1.0" {
 		t.Errorf("expected User-Agent header, got %q", ctx.Headers["User-Agent"])
 	}
+	if got := ctx.Resty.Header.Get("User-Agent"); got != "TestAgent/1.0" {
+		t.Errorf("expected resty User-Agent override, got %q", got)
+	}
 }
 
 func TestAppContext_NilHeaders(t *testing.T) {
@@ -37,5 +40,8 @@ func TestAppContext_NilHeaders(t *testing.T) {
 	}
 	if ctx.Headers != nil {
 		t.Error("expected nil headers when not provided")
+	}
+	if got := ctx.Resty.Header.Get("User-Agent"); got != DefaultUserAgent {
+		t.Errorf("expected default User-Agent, got %q", got)
 	}
 }

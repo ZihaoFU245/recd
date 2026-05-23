@@ -294,6 +294,40 @@ func TestFinalizeTempRecordingKeepsTempsWhenOutputIsEmpty(t *testing.T) {
 	assertExists(t, audioPath)
 }
 
+func TestNextOutputPathUsesBaseWhenAvailable(t *testing.T) {
+	dir := t.TempDir()
+	pattern := filepath.Join(dir, "{{.Username}}{{if .Sequence}}_{{.Sequence}}{{end}}")
+	start := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+
+	got, err := nextOutputPath(pattern, "testuser", start)
+	if err != nil {
+		t.Fatalf("nextOutputPath() error: %v", err)
+	}
+
+	want := filepath.Join(dir, "testuser.mkv")
+	if got != want {
+		t.Fatalf("unexpected output path: got %q want %q", got, want)
+	}
+}
+
+func TestNextOutputPathUsesSequenceWhenBaseExists(t *testing.T) {
+	dir := t.TempDir()
+	pattern := filepath.Join(dir, "{{.Username}}{{if .Sequence}}_{{.Sequence}}{{end}}")
+	start := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+
+	writeTestFile(t, dir, "testuser.mkv", []byte("existing"))
+
+	got, err := nextOutputPath(pattern, "testuser", start)
+	if err != nil {
+		t.Fatalf("nextOutputPath() error: %v", err)
+	}
+
+	want := filepath.Join(dir, "testuser_1.mkv")
+	if got != want {
+		t.Fatalf("unexpected output path: got %q want %q", got, want)
+	}
+}
+
 type nopWriteCloser struct {
 	*bytes.Buffer
 }

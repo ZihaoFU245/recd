@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -15,8 +16,15 @@ import (
 func (m *Monitor) checkStreamStatus(username string) (online bool, hlsSource string) {
 	url := fmt.Sprintf("https://chaturbate.com/%s/", username)
 
-	resp, err := m.ctx.Resty.R().Get(url)
+	reqCtx, finish := m.requestContext()
+	defer finish()
+
+	resp, err := m.ctx.Resty.R().SetContext(reqCtx).Get(url)
 	if err != nil {
+		if reqCtx.Err() != nil {
+			m.ctx.Logger.Debug("stream status check canceled", "username", username)
+			return false, ""
+		}
 		m.ctx.Logger.Error("failed to fetch page", "username", username, "error", err)
 		return false, ""
 	}
@@ -66,4 +74,22 @@ func (m *Monitor) checkStreamStatus(username string) (online bool, hlsSource str
 	}
 
 	return online, dossier.HlsSource
+}
+
+func (m *Monitor) requestContext() (context.Context, func()) {
+	reqCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		select {
+		case <-m.stopCh:
+			cancel()
+		case <-done:
+		}
+	}()
+
+	return reqCtx, func() {
+		close(done)
+		cancel()
+	}
 }
