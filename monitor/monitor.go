@@ -101,9 +101,19 @@ func (m *Monitor) tick() {
 	now := time.Now()
 	for username, retryAt := range m.respawnAfter {
 		if now.After(retryAt) {
-			delete(m.respawnAfter, username)
 			m.ctx.Logger.Info("retrying after error delay", "username", username)
-			if online, hlsSource := m.checkStreamStatus(username); online {
+			online, hlsSource, err := m.checkStreamStatus(username)
+			if err != nil {
+				m.ctx.Logger.Warn("retry status check failed",
+					"username", username,
+					"delay", respawnDelayError,
+					"error", err,
+				)
+				m.respawnAfter[username] = now.Add(respawnDelayError)
+				continue
+			}
+			delete(m.respawnAfter, username)
+			if online {
 				m.startChannelLocked(username, hlsSource)
 			}
 		}
@@ -113,7 +123,15 @@ func (m *Monitor) tick() {
 		ch, exists := m.channels[cfg.Username]
 
 		if exists {
-			if !m.isStreamOnline(cfg.Username) {
+			online, err := m.isStreamOnline(cfg.Username)
+			if err != nil {
+				m.ctx.Logger.Warn("stream status check failed; keeping channel running",
+					"username", cfg.Username,
+					"error", err,
+				)
+				continue
+			}
+			if !online {
 				m.ctx.Logger.Info("stream offline, stopping channel", "username", cfg.Username)
 				ch.Stop()
 				delete(m.channels, cfg.Username)
@@ -126,7 +144,12 @@ func (m *Monitor) tick() {
 			continue
 		}
 
-		if online, hlsSource := m.checkStreamStatus(cfg.Username); online {
+		if online, hlsSource, err := m.checkStreamStatus(cfg.Username); err != nil {
+			m.ctx.Logger.Warn("stream status check failed",
+				"username", cfg.Username,
+				"error", err,
+			)
+		} else if online {
 			m.startChannelLocked(cfg.Username, hlsSource)
 		}
 	}
@@ -184,7 +207,15 @@ func (m *Monitor) handleResult(r channel.Result) {
 	switch r.Status {
 	case channel.StatusCompleted, channel.StatusMaxDuration, channel.StatusMaxFilesize:
 		m.mu.Lock()
-		if online, hlsSource := m.checkStreamStatus(r.Username); online {
+		online, hlsSource, err := m.checkStreamStatus(r.Username)
+		if err != nil {
+			m.ctx.Logger.Warn("restart status check failed, scheduling retry",
+				"username", r.Username,
+				"delay", respawnDelayError,
+				"error", err,
+			)
+			m.respawnAfter[r.Username] = time.Now().Add(respawnDelayError)
+		} else if online {
 			m.startChannelLocked(r.Username, hlsSource)
 		}
 		m.mu.Unlock()
@@ -232,7 +263,12 @@ func (m *Monitor) Reload(delta []config.ChannelConfig) {
 		}
 
 		// Start new channel immediately if stream is online.
-		if online, hlsSource := m.checkStreamStatus(newCfg.Username); online {
+		if online, hlsSource, err := m.checkStreamStatus(newCfg.Username); err != nil {
+			m.ctx.Logger.Warn("reload status check failed",
+				"username", newCfg.Username,
+				"error", err,
+			)
+		} else if online {
 			m.startChannelLocked(newCfg.Username, hlsSource)
 		}
 	}
@@ -261,9 +297,9 @@ func (m *Monitor) upsertConfigLocked(cfg config.ChannelConfig) {
 	m.configs = append(m.configs, cfg)
 }
 
-func (m *Monitor) isStreamOnline(username string) bool {
-	online, _ := m.checkStreamStatus(username)
-	return online
+func (m *Monitor) isStreamOnline(username string) (bool, error) {
+	online, _, err := m.checkStreamStatus(username)
+	return online, err
 }
 
 func (m *Monitor) shutdownAllChannels() {

@@ -3,6 +3,7 @@ package monitor
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -100,6 +101,66 @@ func TestMonitorTick_NoOnlineStreams(t *testing.T) {
 		t.Errorf("expected 0 channels, got %d", len(mon.channels))
 	}
 	mon.mu.Unlock()
+}
+
+func TestMonitorTick_KeepsRunningChannelWhenStatusCheckFails(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	ctx := config.NewAppContext(logger, nil)
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, errors.New("temporary fetch failure")
+	}))
+
+	cfg := config.ChannelConfig{IsPaused: false, Username: "running_user"}
+	mon := New(ctx, []config.ChannelConfig{cfg})
+	mon.channels[cfg.Username] = channel.New(ctx, cfg, "", nil)
+
+	mon.tick()
+
+	mon.mu.Lock()
+	defer mon.mu.Unlock()
+	if _, ok := mon.channels[cfg.Username]; !ok {
+		t.Fatal("expected running channel to remain after inconclusive status check")
+	}
+}
+
+func TestMonitorHandleResult_SchedulesRetryWhenRestartStatusCheckFails(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	ctx := config.NewAppContext(logger, nil)
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, errors.New("temporary fetch failure")
+	}))
+
+	mon := New(ctx, []config.ChannelConfig{
+		{IsPaused: false, Username: "finished_user"},
+	})
+
+	mon.handleResult(channel.Result{
+		Username: "finished_user",
+		Status:   channel.StatusCompleted,
+	})
+
+	mon.mu.Lock()
+	defer mon.mu.Unlock()
+	if _, waiting := mon.respawnAfter["finished_user"]; !waiting {
+		t.Fatal("expected retry to be scheduled after inconclusive restart status check")
+	}
+}
+
+func TestParseRoomDossierAllowsEscapedQuoteSemicolon(t *testing.T) {
+	payload := `{"room_status":"public","hls_source":"https://edge.example.test/live.m3u8","broadcaster_username":"quoted_user","num_viewers":12,"room_title":"quote \\\"; still inside"}`
+	escaped := strings.Trim(strconv.Quote(payload), `"`)
+	html := `<script>
+		window.initialRoomDossier =
+			"` + escaped + `";
+	</script>`
+
+	dossier, err := parseRoomDossier(html)
+	if err != nil {
+		t.Fatalf("parseRoomDossier() error: %v", err)
+	}
+	if dossier.RoomStatus != "public" || dossier.HlsSource == "" || dossier.BroadcasterUsername != "quoted_user" {
+		t.Fatalf("unexpected dossier: %+v", dossier)
+	}
 }
 
 func TestMonitorDoneChannel(t *testing.T) {

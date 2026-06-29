@@ -13,7 +13,7 @@ import (
 // checkStreamStatus fetches the chaturbate page for the given username,
 // extracts the window.initialRoomDossier JSON, decodes unicode escapes,
 // and returns whether the stream is online along with the hls_source URL.
-func (m *Monitor) checkStreamStatus(username string) (online bool, hlsSource string) {
+func (m *Monitor) checkStreamStatus(username string) (online bool, hlsSource string, err error) {
 	url := fmt.Sprintf("https://chaturbate.com/%s/", username)
 
 	reqCtx, finish := m.requestContext()
@@ -23,44 +23,20 @@ func (m *Monitor) checkStreamStatus(username string) (online bool, hlsSource str
 	if err != nil {
 		if reqCtx.Err() != nil {
 			m.ctx.Logger.Debug("stream status check canceled", "username", username)
-			return false, ""
+			return false, "", reqCtx.Err()
 		}
 		m.ctx.Logger.Error("failed to fetch page", "username", username, "error", err)
-		return false, ""
+		return false, "", err
 	}
 	if resp.StatusCode() != 200 {
 		m.ctx.Logger.Error("non-200 page response", "username", username, "status", resp.StatusCode())
-		return false, ""
+		return false, "", fmt.Errorf("page HTTP %d", resp.StatusCode())
 	}
 
-	body := resp.String()
-
-	// Extract: window.initialRoomDossier = "{escaped JSON}";
-	const marker = `initialRoomDossier = "`
-	start := strings.Index(body, marker)
-	if start < 0 {
-		m.ctx.Logger.Error("initialRoomDossier not found in page", "username", username)
-		return false, ""
-	}
-	start += len(marker)
-	end := strings.Index(body[start:], `";`)
-	if end < 0 {
-		m.ctx.Logger.Error("initialRoomDossier closing marker not found", "username", username)
-		return false, ""
-	}
-	escapedJSON := body[start : start+end]
-
-	// Decode Go-style unicode escape sequences (\u0022 -> ", \u002D -> -, etc.).
-	decoded, err := strconv.Unquote(`"` + escapedJSON + `"`)
+	dossier, err := parseRoomDossier(resp.String())
 	if err != nil {
-		m.ctx.Logger.Error("failed to unquote room dossier", "username", username, "error", err)
-		return false, ""
-	}
-
-	var dossier config.RoomDossier
-	if err := json.Unmarshal([]byte(decoded), &dossier); err != nil {
 		m.ctx.Logger.Error("failed to parse room dossier JSON", "username", username, "error", err)
-		return false, ""
+		return false, "", err
 	}
 
 	online = dossier.RoomStatus == "public" && dossier.HlsSource != ""
@@ -73,7 +49,54 @@ func (m *Monitor) checkStreamStatus(username string) (online bool, hlsSource str
 		m.ctx.Logger.Info("stream is offline", "username", username, "status", dossier.RoomStatus)
 	}
 
-	return online, dossier.HlsSource
+	return online, dossier.HlsSource, nil
+}
+
+func parseRoomDossier(body string) (config.RoomDossier, error) {
+	const marker = `initialRoomDossier`
+	start := strings.Index(body, marker)
+	if start < 0 {
+		return config.RoomDossier{}, fmt.Errorf("initialRoomDossier not found")
+	}
+
+	assignment := body[start+len(marker):]
+	eq := strings.IndexByte(assignment, '=')
+	if eq < 0 {
+		return config.RoomDossier{}, fmt.Errorf("initialRoomDossier assignment not found")
+	}
+
+	quoted := strings.TrimLeft(assignment[eq+1:], " \t\r\n")
+	if quoted == "" || quoted[0] != '"' {
+		return config.RoomDossier{}, fmt.Errorf("initialRoomDossier quoted value not found")
+	}
+
+	escapedJSON, err := readQuotedJSString(quoted)
+	if err != nil {
+		return config.RoomDossier{}, err
+	}
+
+	decoded, err := strconv.Unquote(`"` + escapedJSON + `"`)
+	if err != nil {
+		return config.RoomDossier{}, fmt.Errorf("unquote room dossier: %w", err)
+	}
+
+	var dossier config.RoomDossier
+	if err := json.Unmarshal([]byte(decoded), &dossier); err != nil {
+		return config.RoomDossier{}, fmt.Errorf("decode room dossier: %w", err)
+	}
+	return dossier, nil
+}
+
+func readQuotedJSString(s string) (string, error) {
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '"':
+			return s[1:i], nil
+		}
+	}
+	return "", fmt.Errorf("initialRoomDossier closing quote not found")
 }
 
 func (m *Monitor) requestContext() (context.Context, func()) {
