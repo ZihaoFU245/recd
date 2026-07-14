@@ -117,7 +117,7 @@ func main() {
 	ctx := config.NewAppContext(logger, headers)
 
 	mon := monitor.New(ctx, targets)
-	go recoverable("monitor", mon.Run)
+	go mon.Run()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -153,13 +153,4 @@ func main() {
 			return
 		}
 	}
-}
-
-func recoverable(name string, fn func()) {
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Error("goroutine panic", "name", name, "panic", r)
-		}
-	}()
-	fn()
 }

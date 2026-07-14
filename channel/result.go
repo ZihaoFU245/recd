@@ -6,11 +6,12 @@ import "time"
 type Status int
 
 const (
-	StatusCompleted    Status = iota // normal finish (stopped by monitor or graceful exit)
-	StatusMaxDuration                // configured max_duration reached
-	StatusMaxFilesize                // configured max_filesize reached
-	StatusError                      // unexpected error during recording
-	StatusDesync                     // audio/video duration drift exceeded threshold
+	StatusCompleted   Status = iota // normal finish (stopped by monitor or graceful exit)
+	StatusMaxDuration               // configured max_duration reached
+	StatusMaxFilesize               // configured max_filesize reached
+	StatusError                     // unexpected error during recording
+	StatusDesync                    // audio/video duration drift exceeded threshold
+	StatusEnded                     // recorder ended without a requested stop
 )
 
 func (s Status) String() string {
@@ -25,6 +26,8 @@ func (s Status) String() string {
 		return "error"
 	case StatusDesync:
 		return "desync"
+	case StatusEnded:
+		return "ended"
 	default:
 		return "unknown"
 	}
@@ -32,11 +35,12 @@ func (s Status) String() string {
 
 // Result is sent from a channel goroutine back to the monitor when recording ends.
 type Result struct {
-	Username string
-	Status   Status
-	Err      error
-	Duration time.Duration
-	Filesize int64
-	Path     string
-	Reloaded bool
+	Username  string
+	Session   uint64
+	Status    Status
+	Err       error
+	FastRetry bool
+	Duration  time.Duration
+	Filesize  int64
+	Path      string
 }

@@ -158,6 +158,10 @@ User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 Referer: https://chaturbate.com/{username}/
 ```
 
+The shared Go HTTP transport negotiates HTTP/2 whenever ALPN offers `h2`; the
+July 14 room-page and CDN master-playlist checks both used HTTP/2. HTTP/3 is not
+used.
+
 ### Endpoints
 
 | Purpose | URL | Method |
@@ -204,7 +208,7 @@ session for the configured username.
 
 ### Lifecycle
 
-1. `monitor.startChannelLocked` creates `channel.New(ctx, cfg, hlsSource, resultCh)`.
+1. The monitor creates one numbered `channel.Channel` session for each online target.
 2. `Channel.Run` marks the channel active and calls `record(...)`.
 3. `record` chooses a non-conflicting output path from the configured pattern,
    fetches the master playlist from `hls_source`, selects the closest video
@@ -223,16 +227,16 @@ session for the configured username.
    Unexpected recorder failures use `error`; excessive audio/video drift uses
    `desync`.
 
-### Stop and Reload
+### Stop, Reload, and Recovery
 
-- `Channel.Stop` closes `stopCh`. The worker exits gracefully, finalizes any
-  mergeable media, and returns `StatusCompleted`.
-- `Channel.Reload` sends a non-blocking signal on `reloadCh`. The worker exits
-  with `Reloaded=true` so the monitor does not delete or retry a newly spawned
-  replacement channel.
-- Initial master-playlist fetching is cancellable. If the monitor stops or
-  reloads while that HTTP request is in flight, the request context is canceled
-  and the worker exits instead of hanging inside Resty.
+- Each session has one cancellable context. Stopping a channel cancels its
+  master-playlist, media-playlist, and segment requests immediately.
+- Reload removes the old numbered session before scheduling a fresh probe. A
+  late result includes its session number and therefore cannot stop or retry a
+  newer recording.
+- The monitor performs room probes independently, rather than holding its state
+  lock during HTTP. HTTP request faults retry after 1s with a 15s cap;
+  unexpected recorder termination waits 30s before a new probe.
 
 ### Segment Handling
 
@@ -251,16 +255,9 @@ session for the configured username.
 
 ### Bugs Fixed in This Pass
 
-- Shared Resty clients now use the required Chrome User-Agent by default, while
-  still allowing `--additional-headers` to override it.
-- Resty now has a finite timeout, and monitor stream-status checks are
-  cancellable on shutdown.
-- Channel startup no longer hangs forever if `Stop` or `Reload` happens during
-  the initial master-playlist request.
-- Recorder output paths now use the existing `.Sequence` template variable when
-  the base output file already exists, avoiding accidental overwrites on quick
-  respawns.
-- The temp-file merge command now passes `-y` before the output path.
-- Removed the unused `downloadToWriter` helper.
-- The real-segment verifier no longer requires a missing `headers.json` file;
-  the application default UA now covers that requirement.
+- Shared Resty clients use the required Chrome User-Agent by default and have a
+  finite 10-second timeout.
+- Session results are generation-safe, so an old worker cannot disturb a newer
+  worker after reload or a quick restart.
+- All recorder HTTP work uses the session context, not just master-playlist
+  selection.

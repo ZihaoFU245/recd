@@ -1,7 +1,7 @@
 package monitor
 
 import (
-	"log/slog"
+	"context"
 	"sync"
 	"time"
 
@@ -9,324 +9,308 @@ import (
 	"recd/config"
 )
 
-// respawnDelayError is the delay before retrying a channel that failed with an error.
-const respawnDelayError = 60 * time.Second
+const (
+	monitorTick          = 250 * time.Millisecond
+	liveCheckInterval    = 30 * time.Second
+	offlineCheckInterval = 15 * time.Second
+	statusRetryInterval  = 5 * time.Second
+	initialRetryDelay    = time.Second
+	maxRetryDelay        = 15 * time.Second
+	slowRetryDelay       = 30 * time.Second
+	shutdownTimeout      = 10 * time.Second
+)
 
-// shutdownTimeout is the maximum time to wait for channel goroutines to finish during shutdown.
-const shutdownTimeout = 10 * time.Second
+type runningChannel struct {
+	session uint64
+	channel *channel.Channel
+}
 
+type streamStatus struct {
+	username  string
+	online    bool
+	hlsSource string
+	err       error
+}
+
+// Monitor supervises independent recording sessions. Network calls never hold
+// its mutex, so one slow room cannot delay another room's restart.
 type Monitor struct {
-	ctx      *config.AppContext
-	configs  []config.ChannelConfig
-	channels map[string]*channel.Channel
-	mu       sync.Mutex
+	ctx *config.AppContext
+
+	mu          sync.Mutex
+	configs     map[string]config.ChannelConfig
+	channels    map[string]runningChannel
+	checking    map[string]bool
+	nextCheck   map[string]time.Time
+	failures    map[string]int
+	nextSession uint64
+
+	resultCh chan channel.Result
+	statusCh chan streamStatus
+
+	runCtx   context.Context
+	cancel   context.CancelFunc
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
-
-	// resultCh receives recording outcomes from channel goroutines.
-	resultCh chan channel.Result
-
-	// respawnAfter schedules delayed retries for channels that failed with errors.
-	respawnAfter map[string]time.Time
-
-	// wg tracks active channel goroutines for graceful shutdown.
-	wg sync.WaitGroup
+	wg       sync.WaitGroup
 }
 
 func New(ctx *config.AppContext, configs []config.ChannelConfig) *Monitor {
+	active := make(map[string]config.ChannelConfig, len(configs))
+	for _, cfg := range configs {
+		if !cfg.IsPaused {
+			active[cfg.Username] = cfg
+		}
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
 	return &Monitor{
-		ctx:          ctx,
-		configs:      configs,
-		channels:     make(map[string]*channel.Channel),
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan struct{}),
-		resultCh:     make(chan channel.Result, 64),
-		respawnAfter: make(map[string]time.Time),
+		ctx:       ctx,
+		configs:   active,
+		channels:  make(map[string]runningChannel),
+		checking:  make(map[string]bool),
+		nextCheck: make(map[string]time.Time),
+		failures:  make(map[string]int),
+		resultCh:  make(chan channel.Result, max(16, len(active)*2)),
+		statusCh:  make(chan streamStatus, max(16, len(active)*2)),
+		runCtx:    runCtx,
+		cancel:    cancel,
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
 	}
 }
 
 func (m *Monitor) Run() {
-	defer func() {
-		if r := recover(); r != nil {
-			m.ctx.Logger.Error("goroutine panic", "name", "monitor", "panic", r)
-		}
-		close(m.doneCh)
-	}()
+	defer close(m.doneCh)
 
 	m.ctx.Logger.Info("monitor watching channels", "count", len(m.configs))
+	m.mu.Lock()
+	for username := range m.configs {
+		m.nextCheck[username] = time.Now()
+	}
+	m.mu.Unlock()
 
-	// Run an immediate tick to check streams without waiting for the first interval.
-	m.tick()
-
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(monitorTick)
 	defer ticker.Stop()
 
 	for {
+		m.tick()
 		select {
 		case <-m.stopCh:
-			m.ctx.Logger.Info("monitor stopping")
-			m.shutdownAllChannels()
-			// Wait for all channel goroutines to finish (best-effort, with timeout).
-			waitWithTimeout(&m.wg, shutdownTimeout)
+			m.cancel()
+			m.stopAll()
+			done := make(chan struct{})
+			go func() {
+				m.wg.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(shutdownTimeout):
+				m.ctx.Logger.Warn("timed out waiting for recording sessions to stop")
+			}
 			return
-
-		case <-ticker.C:
-			m.tick()
 
 		case result := <-m.resultCh:
 			m.handleResult(result)
+
+		case status := <-m.statusCh:
+			m.handleStatus(status)
+
+		case <-ticker.C:
 		}
 	}
 }
 
-// waitWithTimeout waits for a WaitGroup up to the given duration, then returns.
-func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(timeout):
-	}
-}
-
+// tick starts every due room-status probe. Probes are independent goroutines;
+// state is only changed when their result returns to Run's event loop.
 func (m *Monitor) tick() {
+	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	// Check channels with pending retries.
-	now := time.Now()
-	for username, retryAt := range m.respawnAfter {
-		if now.After(retryAt) {
-			m.ctx.Logger.Info("retrying after error delay", "username", username)
-			online, hlsSource, err := m.checkStreamStatus(username)
-			if err != nil {
-				m.ctx.Logger.Warn("retry status check failed",
-					"username", username,
-					"delay", respawnDelayError,
-					"error", err,
-				)
-				m.respawnAfter[username] = now.Add(respawnDelayError)
-				continue
-			}
-			delete(m.respawnAfter, username)
-			if online {
-				m.startChannelLocked(username, hlsSource)
-			}
-		}
+	if m.runCtx.Err() != nil {
+		return
 	}
-
-	for _, cfg := range m.configs {
-		ch, exists := m.channels[cfg.Username]
-
-		if exists {
-			online, err := m.isStreamOnline(cfg.Username)
-			if err != nil {
-				m.ctx.Logger.Warn("stream status check failed; keeping channel running",
-					"username", cfg.Username,
-					"error", err,
-				)
-				continue
-			}
-			if !online {
-				m.ctx.Logger.Info("stream offline, stopping channel", "username", cfg.Username)
-				ch.Stop()
-				delete(m.channels, cfg.Username)
-			}
+	for username, due := range m.nextCheck {
+		if due.After(now) || m.checking[username] {
 			continue
 		}
-
-		// Skip channels that are waiting for retry.
-		if _, waiting := m.respawnAfter[cfg.Username]; waiting {
+		if _, configured := m.configs[username]; !configured {
+			delete(m.nextCheck, username)
 			continue
 		}
-
-		if online, hlsSource, err := m.checkStreamStatus(cfg.Username); err != nil {
-			m.ctx.Logger.Warn("stream status check failed",
-				"username", cfg.Username,
-				"error", err,
-			)
-		} else if online {
-			m.startChannelLocked(cfg.Username, hlsSource)
-		}
+		m.checking[username] = true
+		delete(m.nextCheck, username)
+		m.wg.Add(1)
+		go func(username string) {
+			defer m.wg.Done()
+			online, hlsSource, err := m.checkStreamStatus(m.runCtx, username)
+			select {
+			case m.statusCh <- streamStatus{username: username, online: online, hlsSource: hlsSource, err: err}:
+			case <-m.stopCh:
+			}
+		}(username)
 	}
 }
 
-// startChannelLocked creates and starts a new channel goroutine.
-// Must be called with m.mu held.
-func (m *Monitor) startChannelLocked(username, hlsSource string) {
-	var cfg config.ChannelConfig
-	for _, c := range m.configs {
-		if c.Username == username {
-			cfg = c
-			break
-		}
-	}
-	ch := channel.New(m.ctx, cfg, hlsSource, m.resultCh)
-	m.channels[username] = ch
-
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		recoverable("channel:"+username, ch.Run)
-	}()
-
-	m.ctx.Logger.Info("stream online, starting channel",
-		"username", username,
-		"hls_source", hlsSource != "",
-	)
-}
-
-// handleResult processes a recording outcome from a channel goroutine.
-// Normal completions trigger an immediate respawn if the stream is still online.
-// Errors schedule a delayed retry to avoid tight crash loops.
-func (m *Monitor) handleResult(r channel.Result) {
-	m.ctx.Logger.Info("channel finished",
-		"username", r.Username,
-		"status", r.Status.String(),
-		"duration", r.Duration,
-		"size", r.Filesize,
-		"path", r.Path,
-		"error", r.Err,
-		"reloaded", r.Reloaded,
-	)
-
-	if r.Reloaded {
-		// Reload already removed the old channel from m.channels and started
-		// a new one. Don't touch m.channels, don't schedule restart/retry.
+func (m *Monitor) handleStatus(status streamStatus) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.checking[status.username] = false
+	if _, configured := m.configs[status.username]; !configured || m.runCtx.Err() != nil {
 		return
 	}
 
-	m.mu.Lock()
-	delete(m.channels, r.Username)
-	m.mu.Unlock()
-
-	switch r.Status {
-	case channel.StatusCompleted, channel.StatusMaxDuration, channel.StatusMaxFilesize:
-		m.mu.Lock()
-		online, hlsSource, err := m.checkStreamStatus(r.Username)
-		if err != nil {
-			m.ctx.Logger.Warn("restart status check failed, scheduling retry",
-				"username", r.Username,
-				"delay", respawnDelayError,
-				"error", err,
-			)
-			m.respawnAfter[r.Username] = time.Now().Add(respawnDelayError)
-		} else if online {
-			m.startChannelLocked(r.Username, hlsSource)
+	if status.err != nil {
+		delay := statusRetryInterval
+		if _, recording := m.channels[status.username]; !recording {
+			m.failures[status.username]++
+			delay = retryDelay(m.failures[status.username])
 		}
-		m.mu.Unlock()
-
-	case channel.StatusError, channel.StatusDesync:
-		m.ctx.Logger.Info("scheduling retry after error",
-			"username", r.Username,
-			"delay", respawnDelayError,
-		)
-		m.mu.Lock()
-		m.respawnAfter[r.Username] = time.Now().Add(respawnDelayError)
-		m.mu.Unlock()
+		m.nextCheck[status.username] = time.Now().Add(delay)
+		m.ctx.Logger.Warn("stream status check failed", "username", status.username, "delay", delay, "error", status.err)
+		return
 	}
+
+	if !status.online {
+		m.failures[status.username] = 0
+		if current, recording := m.channels[status.username]; recording {
+			m.ctx.Logger.Info("stream offline, stopping channel", "username", status.username)
+			current.channel.Stop()
+			delete(m.channels, status.username)
+		}
+		m.nextCheck[status.username] = time.Now().Add(offlineCheckInterval)
+		return
+	}
+
+	if _, recording := m.channels[status.username]; !recording {
+		m.startChannelLocked(status.username, status.hlsSource)
+	} else {
+		// A session that survives until its next live check is healthy enough to
+		// reset request-failure backoff.
+		m.failures[status.username] = 0
+	}
+	m.nextCheck[status.username] = time.Now().Add(liveCheckInterval)
 }
 
-// Reload applies a config delta to the monitor. Channels with IsPaused=true
-// are stopped and removed from tracking. Other channels are added/updated:
-// running channels are signaled via Reload() and a new goroutine is spawned
-// immediately if the stream is online.
+func (m *Monitor) startChannelLocked(username, hlsSource string) {
+	cfg, ok := m.configs[username]
+	if !ok {
+		return
+	}
+	m.nextSession++
+	session := m.nextSession
+	ch := channel.New(m.ctx, cfg, hlsSource, session, m.resultCh, m.stopCh)
+	m.channels[username] = runningChannel{session: session, channel: ch}
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		ch.Run()
+	}()
+	m.ctx.Logger.Info("stream online, starting channel", "username", username, "hls_source", hlsSource != "")
+}
+
+func (m *Monitor) handleResult(result channel.Result) {
+	m.ctx.Logger.Info("channel finished",
+		"username", result.Username,
+		"status", result.Status.String(),
+		"duration", result.Duration,
+		"size", result.Filesize,
+		"path", result.Path,
+		"error", result.Err,
+	)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, recording := m.channels[result.Username]
+	if !recording || current.session != result.Session {
+		m.ctx.Logger.Debug("ignoring stale channel result", "username", result.Username, "session", result.Session)
+		return
+	}
+	delete(m.channels, result.Username)
+	if _, configured := m.configs[result.Username]; !configured || m.runCtx.Err() != nil {
+		return
+	}
+
+	if result.Status == channel.StatusError || result.Status == channel.StatusDesync || result.Status == channel.StatusEnded {
+		m.failures[result.Username]++
+		delay := slowRetryDelay
+		if result.FastRetry {
+			delay = retryDelay(m.failures[result.Username])
+		}
+		m.nextCheck[result.Username] = time.Now().Add(delay)
+		m.ctx.Logger.Warn("recording failed; scheduling stream probe",
+			"username", result.Username,
+			"delay", delay,
+			"attempt", m.failures[result.Username],
+			"fast_retry", result.FastRetry,
+			"error", result.Err,
+		)
+		return
+	}
+
+	m.failures[result.Username] = 0
+	m.nextCheck[result.Username] = time.Now()
+}
+
+func retryDelay(attempt int) time.Duration {
+	delay := initialRetryDelay
+	for attempt > 1 && delay < maxRetryDelay {
+		delay *= 2
+		attempt--
+	}
+	if delay > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return delay
+}
+
+// Reload only updates in-memory state and stops replaced workers. The next
+// event-loop tick probes new or changed rooms without holding a mutex on I/O.
 func (m *Monitor) Reload(delta []config.ChannelConfig) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	for _, newCfg := range delta {
-		if newCfg.IsPaused {
-			if ch, ok := m.channels[newCfg.Username]; ok {
-				ch.Stop()
-				delete(m.channels, newCfg.Username)
-				m.ctx.Logger.Info("channel paused or removed, stopping", "username", newCfg.Username)
+	now := time.Now()
+	for _, cfg := range delta {
+		if cfg.IsPaused {
+			delete(m.configs, cfg.Username)
+			delete(m.nextCheck, cfg.Username)
+			delete(m.failures, cfg.Username)
+			if current, recording := m.channels[cfg.Username]; recording {
+				current.channel.Stop()
+				delete(m.channels, cfg.Username)
 			}
-			m.removeFromConfigsLocked(newCfg.Username)
-			delete(m.respawnAfter, newCfg.Username)
+			m.ctx.Logger.Info("channel paused or removed, stopping", "username", cfg.Username)
 			continue
 		}
 
-		// Not paused — upsert config and clear any pending retry.
-		m.upsertConfigLocked(newCfg)
-		delete(m.respawnAfter, newCfg.Username)
-
-		// If currently running, signal reload and forget the old channel.
-		if ch, ok := m.channels[newCfg.Username]; ok {
-			ch.Reload()
-			delete(m.channels, newCfg.Username)
-			m.ctx.Logger.Info("channel reload triggered", "username", newCfg.Username)
+		m.configs[cfg.Username] = cfg
+		delete(m.failures, cfg.Username)
+		if current, recording := m.channels[cfg.Username]; recording {
+			current.channel.Stop()
+			delete(m.channels, cfg.Username)
 		}
-
-		// Start new channel immediately if stream is online.
-		if online, hlsSource, err := m.checkStreamStatus(newCfg.Username); err != nil {
-			m.ctx.Logger.Warn("reload status check failed",
-				"username", newCfg.Username,
-				"error", err,
-			)
-		} else if online {
-			m.startChannelLocked(newCfg.Username, hlsSource)
-		}
+		m.nextCheck[cfg.Username] = now
 	}
 }
 
-// removeFromConfigsLocked removes a channel config by username from m.configs.
-// Must be called with m.mu held.
-func (m *Monitor) removeFromConfigsLocked(username string) {
-	for i, c := range m.configs {
-		if c.Username == username {
-			m.configs = append(m.configs[:i], m.configs[i+1:]...)
-			return
-		}
-	}
-}
-
-// upsertConfigLocked replaces an existing config for username or appends a new
-// one to m.configs. Must be called with m.mu held.
-func (m *Monitor) upsertConfigLocked(cfg config.ChannelConfig) {
-	for i, c := range m.configs {
-		if c.Username == cfg.Username {
-			m.configs[i] = cfg
-			return
-		}
-	}
-	m.configs = append(m.configs, cfg)
-}
-
-func (m *Monitor) isStreamOnline(username string) (bool, error) {
-	online, _, err := m.checkStreamStatus(username)
-	return online, err
-}
-
-func (m *Monitor) shutdownAllChannels() {
+func (m *Monitor) stopAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for username, ch := range m.channels {
+	for username, current := range m.channels {
 		m.ctx.Logger.Info("shutting down channel", "username", username)
-		ch.Stop()
+		current.channel.Stop()
 	}
-	m.channels = make(map[string]*channel.Channel)
+	m.channels = make(map[string]runningChannel)
 }
 
 func (m *Monitor) Stop() {
 	m.stopOnce.Do(func() {
+		m.cancel()
 		close(m.stopCh)
 	})
 }
 
 func (m *Monitor) Done() <-chan struct{} {
 	return m.doneCh
-}
-
-func recoverable(name string, fn func()) {
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Error("goroutine panic", "name", name, "panic", r)
-		}
-	}()
-	fn()
 }

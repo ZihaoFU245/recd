@@ -1,61 +1,77 @@
 package channel
 
 import (
+	"context"
+	"fmt"
 	"sync"
 
 	"recd/config"
 )
 
+// Channel owns one recording session. A Channel is never reused: the monitor
+// creates a replacement when a stream needs to be restarted.
 type Channel struct {
-	ctx       *config.AppContext
-	cfg       config.ChannelConfig
-	hlsSource string
-	resultCh  chan<- Result
-	stopCh    chan struct{}
-	reloadCh  chan struct{}
-	stopOnce  sync.Once
-	mu        sync.Mutex
-	active    bool
+	ctx            *config.AppContext
+	cfg            config.ChannelConfig
+	hlsSource      string
+	session        uint64
+	resultCh       chan<- Result
+	supervisorDone <-chan struct{}
+
+	runCtx context.Context
+	cancel context.CancelFunc
+
+	mu      sync.Mutex
+	started bool
+	active  bool
 }
 
-// New creates a new channel goroutine handle. The resultCh is used to
-// send the recording outcome back to the monitor when the session ends.
-func New(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string, resultCh chan<- Result) *Channel {
+// New creates a recording session. supervisorDone lets a worker leave without
+// blocking if its monitor has already shut down.
+func New(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string, session uint64, resultCh chan<- Result, supervisorDone <-chan struct{}) *Channel {
+	runCtx, cancel := context.WithCancel(context.Background())
 	return &Channel{
-		ctx:       ctx,
-		cfg:       cfg,
-		hlsSource: hlsSource,
-		resultCh:  resultCh,
-		stopCh:    make(chan struct{}),
-		reloadCh:  make(chan struct{}, 1),
+		ctx:            ctx,
+		cfg:            cfg,
+		hlsSource:      hlsSource,
+		session:        session,
+		resultCh:       resultCh,
+		supervisorDone: supervisorDone,
+		runCtx:         runCtx,
+		cancel:         cancel,
 	}
 }
 
-// Run starts the recording loop. It blocks until the channel is stopped
-// or the recording finishes naturally. The outcome is sent on resultCh.
+// Run records until Stop cancels the session. Calling Run more than once is a
+// no-op; this prevents a duplicate writer for the same output.
 func (c *Channel) Run() {
 	c.mu.Lock()
-	if c.active {
+	if c.started {
 		c.mu.Unlock()
 		return
 	}
+	c.started = true
 	c.active = true
 	c.mu.Unlock()
 
+	result := Result{Username: c.cfg.Username, Session: c.session}
 	defer func() {
+		if panicValue := recover(); panicValue != nil {
+			result.Status = StatusError
+			result.Err = fmt.Errorf("panic: %v", panicValue)
+			c.ctx.Logger.Error("channel panic", "username", c.cfg.Username, "panic", panicValue)
+		}
+
 		c.mu.Lock()
 		c.active = false
 		c.mu.Unlock()
-		if r := recover(); r != nil {
-			c.ctx.Logger.Error("goroutine panic", "name", "channel:"+c.cfg.Username, "panic", r)
-			// Send a panic result so the monitor knows this channel died.
-			if c.resultCh != nil {
-				c.resultCh <- Result{
-					Username: c.cfg.Username,
-					Status:   StatusError,
-					Err:      &panicError{panic: r},
-				}
-			}
+
+		if c.resultCh == nil {
+			return
+		}
+		select {
+		case c.resultCh <- result:
+		case <-c.supervisorDone:
 		}
 	}()
 
@@ -67,45 +83,12 @@ func (c *Channel) Run() {
 		"hls_source", c.hlsSource != "",
 	)
 
-	// Run the actual recording; blocks until stop or completion.
-	result := record(c.ctx, c.cfg, c.hlsSource, c.stopCh, c.reloadCh)
-
-	// Notify monitor of the outcome.
-	if c.resultCh != nil {
-		c.resultCh <- result
-	}
+	result = record(c.ctx, c.cfg, c.hlsSource, c.runCtx)
+	result.Session = c.session
 }
 
-// Stop signals the channel to finish recording gracefully, finalize the
-// output file, and exit the Run() goroutine. Safe to call multiple times.
+// Stop is idempotent and cancels every in-flight HTTP request owned by this
+// recording session.
 func (c *Channel) Stop() {
-	c.stopOnce.Do(func() {
-		close(c.stopCh)
-	})
-}
-
-// Reload signals the channel to stop recording due to a config reload.
-// The Run() goroutine will exit with a StatusCompleted result and Reloaded=true.
-// Non-blocking; no-op if a reload signal is already pending.
-func (c *Channel) Reload() {
-	select {
-	case c.reloadCh <- struct{}{}:
-	default:
-	}
-}
-
-// panicError wraps a recovered panic value as an error.
-type panicError struct{ panic any }
-
-func (e *panicError) Error() string { return "panic: " + sprintAny(e.panic) }
-
-func sprintAny(v any) string {
-	switch val := v.(type) {
-	case string:
-		return val
-	case error:
-		return val.Error()
-	default:
-		return "(unknown)"
-	}
+	c.cancel()
 }

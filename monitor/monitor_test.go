@@ -24,9 +24,7 @@ func testContext() *config.AppContext {
 	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return response(req, 200, "text/html", []byte(roomDossierHTML(config.RoomDossier{
 			RoomStatus:          "offline",
-			HlsSource:           "",
 			BroadcasterUsername: strings.Trim(req.URL.Path, "/"),
-			NumViewers:          0,
 		}))), nil
 	}))
 	return ctx
@@ -39,10 +37,7 @@ func TestMonitorStopCancelsStreamStatusCheck(t *testing.T) {
 		<-req.Context().Done()
 		return nil, req.Context().Err()
 	}))
-	mon := New(ctx, []config.ChannelConfig{
-		{IsPaused: false, Username: "slow_user"},
-	})
-
+	mon := New(ctx, []config.ChannelConfig{{Username: "slow_user"}})
 	go mon.Run()
 	time.Sleep(10 * time.Millisecond)
 	mon.Stop()
@@ -55,16 +50,10 @@ func TestMonitorStopCancelsStreamStatusCheck(t *testing.T) {
 }
 
 func TestMonitorLifecycle(t *testing.T) {
-	ctx := testContext()
-	mon := New(ctx, []config.ChannelConfig{
-		{IsPaused: false, Username: "test1"},
-	})
-
+	mon := New(testContext(), []config.ChannelConfig{{Username: "offline_user"}})
 	go mon.Run()
-
 	time.Sleep(10 * time.Millisecond)
 	mon.Stop()
-
 	select {
 	case <-mon.Done():
 	case <-time.After(time.Second):
@@ -72,87 +61,129 @@ func TestMonitorLifecycle(t *testing.T) {
 	}
 }
 
-func TestMonitorNoChannels(t *testing.T) {
-	ctx := testContext()
-	mon := New(ctx, []config.ChannelConfig{})
+func TestMonitorStatusChecksDoNotBlockEachOther(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	ctx := config.NewAppContext(logger, nil)
+	fastChecked := make(chan struct{}, 1)
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/slow/" {
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		}
+		fastChecked <- struct{}{}
+		return response(req, 200, "text/html", []byte(roomDossierHTML(config.RoomDossier{
+			RoomStatus:          "offline",
+			BroadcasterUsername: "fast",
+		}))), nil
+	}))
 
+	mon := New(ctx, []config.ChannelConfig{{Username: "slow"}, {Username: "fast"}})
 	go mon.Run()
-
-	time.Sleep(10 * time.Millisecond)
+	select {
+	case <-fastChecked:
+	case <-time.After(time.Second):
+		mon.Stop()
+		t.Fatal("fast room check was blocked by slow room check")
+	}
 	mon.Stop()
-
 	select {
 	case <-mon.Done():
 	case <-time.After(time.Second):
-		t.Fatal("monitor Run() did not return after Stop()")
+		t.Fatal("monitor did not stop after concurrent status checks")
 	}
 }
 
-func TestMonitorTick_NoOnlineStreams(t *testing.T) {
+func TestMonitorFastRequestRetry(t *testing.T) {
+	mon := New(testContext(), []config.ChannelConfig{{Username: "fast"}})
+	mon.channels["fast"] = runningChannel{session: 1}
+	mon.handleResult(channel.Result{Username: "fast", Session: 1, Status: channel.StatusError, FastRetry: true, Err: errors.New("HTTP 503")})
+
+	delay := time.Until(mon.nextCheck["fast"])
+	if delay < 800*time.Millisecond || delay > 1100*time.Millisecond {
+		t.Fatalf("fast request retry delay = %s, want about %s", delay, initialRetryDelay)
+	}
+}
+
+func TestOnlineProbePreservesBackoffForNewSession(t *testing.T) {
+	mon := New(testContext(), []config.ChannelConfig{{Username: "retry"}})
+	mon.failures["retry"] = 2
+	mon.handleStatus(streamStatus{username: "retry", online: true, hlsSource: "https://stream.test/master.m3u8"})
+	if got := mon.failures["retry"]; got != 2 {
+		t.Fatalf("failure count = %d, want 2 until the session survives a health check", got)
+	}
+	mon.Stop()
+	done := make(chan struct{})
+	go func() {
+		mon.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("test recording session did not stop")
+	}
+}
+
+func TestMonitorSlowRecorderRetry(t *testing.T) {
+	mon := New(testContext(), []config.ChannelConfig{{Username: "ended"}})
+	mon.channels["ended"] = runningChannel{session: 1}
+	mon.handleResult(channel.Result{Username: "ended", Session: 1, Status: channel.StatusEnded, Err: errors.New("ffmpeg exited")})
+
+	delay := time.Until(mon.nextCheck["ended"])
+	if delay < slowRetryDelay-time.Second || delay > slowRetryDelay+time.Second {
+		t.Fatalf("slow retry delay = %s, want about %s", delay, slowRetryDelay)
+	}
+}
+
+func TestMonitorIgnoresStaleResult(t *testing.T) {
+	mon := New(testContext(), []config.ChannelConfig{{Username: "same"}})
+	mon.channels["same"] = runningChannel{session: 2}
+	mon.handleResult(channel.Result{Username: "same", Session: 1, Status: channel.StatusError, FastRetry: true})
+	if got := mon.channels["same"].session; got != 2 {
+		t.Fatalf("stale result replaced current session: got %d", got)
+	}
+}
+
+func TestMonitorStatusFailureKeepsRecording(t *testing.T) {
+	mon := New(testContext(), []config.ChannelConfig{{Username: "running"}})
+	mon.channels["running"] = runningChannel{session: 1}
+	mon.handleStatus(streamStatus{username: "running", err: errors.New("temporary failure")})
+	if _, ok := mon.channels["running"]; !ok {
+		t.Fatal("status failure stopped a healthy recording")
+	}
+	if delay := time.Until(mon.nextCheck["running"]); delay < statusRetryInterval-time.Second {
+		t.Fatalf("status retry delay = %s, want about %s", delay, statusRetryInterval)
+	}
+}
+
+func TestMonitorReloadRemovesAndReplaces(t *testing.T) {
 	ctx := testContext()
-	mon := New(ctx, []config.ChannelConfig{
-		{IsPaused: false, Username: "offline_user"},
-	})
+	old := config.ChannelConfig{Username: "reload", Resolution: 480}
+	mon := New(ctx, []config.ChannelConfig{old})
+	mon.channels["reload"] = runningChannel{session: 1, channel: channel.New(ctx, old, "", 1, nil, nil)}
 
-	mon.tick()
-
-	mon.mu.Lock()
-	if len(mon.channels) != 0 {
-		t.Errorf("expected 0 channels, got %d", len(mon.channels))
+	newCfg := config.ChannelConfig{Username: "reload", Resolution: 720}
+	mon.Reload([]config.ChannelConfig{newCfg})
+	if got := mon.configs["reload"].Resolution; got != 720 {
+		t.Fatalf("resolution = %d, want 720", got)
 	}
-	mon.mu.Unlock()
-}
-
-func TestMonitorTick_KeepsRunningChannelWhenStatusCheckFails(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	ctx := config.NewAppContext(logger, nil)
-	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return nil, errors.New("temporary fetch failure")
-	}))
-
-	cfg := config.ChannelConfig{IsPaused: false, Username: "running_user"}
-	mon := New(ctx, []config.ChannelConfig{cfg})
-	mon.channels[cfg.Username] = channel.New(ctx, cfg, "", nil)
-
-	mon.tick()
-
-	mon.mu.Lock()
-	defer mon.mu.Unlock()
-	if _, ok := mon.channels[cfg.Username]; !ok {
-		t.Fatal("expected running channel to remain after inconclusive status check")
+	if _, ok := mon.channels["reload"]; ok {
+		t.Fatal("old recording still tracked after reload")
 	}
-}
+	if mon.nextCheck["reload"].After(time.Now().Add(time.Second)) {
+		t.Fatal("reload did not schedule an immediate probe")
+	}
 
-func TestMonitorHandleResult_SchedulesRetryWhenRestartStatusCheckFails(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	ctx := config.NewAppContext(logger, nil)
-	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return nil, errors.New("temporary fetch failure")
-	}))
-
-	mon := New(ctx, []config.ChannelConfig{
-		{IsPaused: false, Username: "finished_user"},
-	})
-
-	mon.handleResult(channel.Result{
-		Username: "finished_user",
-		Status:   channel.StatusCompleted,
-	})
-
-	mon.mu.Lock()
-	defer mon.mu.Unlock()
-	if _, waiting := mon.respawnAfter["finished_user"]; !waiting {
-		t.Fatal("expected retry to be scheduled after inconclusive restart status check")
+	mon.Reload([]config.ChannelConfig{{Username: "reload", IsPaused: true}})
+	if _, ok := mon.configs["reload"]; ok {
+		t.Fatal("paused channel remained configured")
 	}
 }
 
 func TestParseRoomDossierAllowsEscapedQuoteSemicolon(t *testing.T) {
 	payload := `{"room_status":"public","hls_source":"https://edge.example.test/live.m3u8","broadcaster_username":"quoted_user","num_viewers":12,"room_title":"quote \\\"; still inside"}`
 	escaped := strings.Trim(strconv.Quote(payload), `"`)
-	html := `<script>
-		window.initialRoomDossier =
-			"` + escaped + `";
-	</script>`
+	html := `<script>window.initialRoomDossier = "` + escaped + `";</script>`
 
 	dossier, err := parseRoomDossier(html)
 	if err != nil {
@@ -164,195 +195,19 @@ func TestParseRoomDossierAllowsEscapedQuoteSemicolon(t *testing.T) {
 }
 
 func TestMonitorDoneChannel(t *testing.T) {
-	ctx := testContext()
-	mon := New(ctx, []config.ChannelConfig{})
-
+	mon := New(testContext(), nil)
 	select {
 	case <-mon.Done():
 		t.Fatal("Done() should not be closed before Run()")
 	default:
 	}
-
 	go mon.Run()
 	time.Sleep(10 * time.Millisecond)
 	mon.Stop()
-
 	select {
 	case <-mon.Done():
 	case <-time.After(time.Second):
 		t.Fatal("Done() was not closed after Stop()")
-	}
-}
-
-func TestMonitorReload_PausedChannel(t *testing.T) {
-	ctx := testContext()
-	cfg := config.ChannelConfig{IsPaused: false, Username: "reload_paused", Resolution: 480}
-	mon := New(ctx, []config.ChannelConfig{cfg})
-
-	// Manually add a channel to simulate running state.
-	mon.channels["reload_paused"] = channel.New(ctx, cfg, "", nil)
-
-	// Reload with IsPaused=true.
-	delta := config.ComputeDelta(mon.configs, []config.ChannelConfig{
-		{IsPaused: true, Username: "reload_paused"},
-	})
-	mon.Reload(delta)
-
-	// Channel should be removed from m.channels and m.configs.
-	mon.mu.Lock()
-	defer mon.mu.Unlock()
-	if _, ok := mon.channels["reload_paused"]; ok {
-		t.Error("expected channel to be removed from m.channels")
-	}
-	for _, c := range mon.configs {
-		if c.Username == "reload_paused" {
-			t.Error("expected channel to be removed from m.configs")
-		}
-	}
-}
-
-func TestMonitorReload_NewChannel(t *testing.T) {
-	ctx := testContext()
-	mon := New(ctx, []config.ChannelConfig{})
-
-	// Reload adds a new channel.
-	delta := config.ComputeDelta(mon.configs, []config.ChannelConfig{
-		{IsPaused: false, Username: "new_user", Resolution: 480},
-	})
-	mon.Reload(delta)
-
-	mon.mu.Lock()
-	defer mon.mu.Unlock()
-
-	// New channel should be added to m.configs.
-	found := false
-	for _, c := range mon.configs {
-		if c.Username == "new_user" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("expected new_user in m.configs")
-	}
-
-	// Should NOT be in m.channels (stream is offline).
-	if _, ok := mon.channels["new_user"]; ok {
-		t.Error("expected no channel started (stream offline)")
-	}
-}
-
-func TestMonitorReload_RemovedChannel(t *testing.T) {
-	ctx := testContext()
-	cfg := config.ChannelConfig{IsPaused: false, Username: "remove_me", Resolution: 480}
-	mon := New(ctx, []config.ChannelConfig{cfg})
-
-	// Simulate running channel.
-	mon.channels["remove_me"] = channel.New(ctx, cfg, "", nil)
-
-	// Reload without the channel.
-	delta := config.ComputeDelta(mon.configs, []config.ChannelConfig{})
-	mon.Reload(delta)
-
-	mon.mu.Lock()
-	defer mon.mu.Unlock()
-
-	if _, ok := mon.channels["remove_me"]; ok {
-		t.Error("expected channel to be removed from m.channels")
-	}
-	for _, c := range mon.configs {
-		if c.Username == "remove_me" {
-			t.Error("expected channel to be removed from m.configs")
-		}
-	}
-}
-
-func TestMonitorReload_ConfigChanged(t *testing.T) {
-	ctx := testContext()
-	cfg := config.ChannelConfig{IsPaused: false, Username: "change_me", Resolution: 480}
-	mon := New(ctx, []config.ChannelConfig{cfg})
-
-	// Simulate running channel with old config.
-	mon.channels["change_me"] = channel.New(ctx, cfg, "", nil)
-
-	// Reload with changed resolution.
-	newCfg := config.ChannelConfig{IsPaused: false, Username: "change_me", Resolution: 720}
-	delta := config.ComputeDelta(mon.configs, []config.ChannelConfig{newCfg})
-	mon.Reload(delta)
-
-	mon.mu.Lock()
-	defer mon.mu.Unlock()
-
-	// Old channel should be removed, config updated.
-	if _, ok := mon.channels["change_me"]; ok {
-		t.Error("expected old channel to be removed from m.channels")
-	}
-	found := false
-	for _, c := range mon.configs {
-		if c.Username == "change_me" {
-			found = true
-			if c.Resolution != 720 {
-				t.Errorf("expected resolution 720, got %d", c.Resolution)
-			}
-		}
-	}
-	if !found {
-		t.Error("expected change_me in m.configs")
-	}
-}
-
-func TestMonitorReload_RetryCleared(t *testing.T) {
-	ctx := testContext()
-	mon := New(ctx, []config.ChannelConfig{
-		{IsPaused: false, Username: "retry_user", Resolution: 480},
-	})
-
-	// Simulate pending retry.
-	mon.respawnAfter["retry_user"] = time.Now().Add(30 * time.Second)
-
-	// Reload with changed config.
-	delta := config.ComputeDelta(mon.configs, []config.ChannelConfig{
-		{IsPaused: false, Username: "retry_user", Resolution: 720},
-	})
-	mon.Reload(delta)
-
-	mon.mu.Lock()
-	defer mon.mu.Unlock()
-
-	if _, waiting := mon.respawnAfter["retry_user"]; waiting {
-		t.Error("expected retry timer to be cleared")
-	}
-}
-
-func TestMonitorHandleResult_Reloaded(t *testing.T) {
-	ctx := testContext()
-	mon := New(ctx, []config.ChannelConfig{
-		{IsPaused: false, Username: "stale", Resolution: 480},
-	})
-
-	// Add a fake running channel.
-	ch := channel.New(ctx, config.ChannelConfig{IsPaused: false, Username: "stale", Resolution: 480}, "", nil)
-	mon.channels["stale"] = ch
-
-	// Send a Reloaded result — handleResult should return early without
-	// touching m.channels or scheduling restart/retry.
-	mon.handleResult(channel.Result{
-		Username: "stale",
-		Status:   channel.StatusCompleted,
-		Reloaded: true,
-		Duration: time.Minute,
-	})
-
-	mon.mu.Lock()
-	defer mon.mu.Unlock()
-
-	// The channel should still be in m.channels (handleResult skipped delete).
-	if _, ok := mon.channels["stale"]; !ok {
-		t.Error("expected stale channel to remain in m.channels (reloaded results ignored)")
-	}
-	// No retry should have been scheduled.
-	if _, waiting := mon.respawnAfter["stale"]; waiting {
-		t.Error("expected no retry for reloaded result")
 	}
 }
 

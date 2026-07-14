@@ -2,6 +2,7 @@ package channel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,7 +36,7 @@ func TestProcessTrackWritesSequenceZero(t *testing.T) {
 		name:   "video",
 	}
 
-	if err := processTrack(testContextWithTransport(server), "https://chaturbate.com/test/", &ts); err != nil {
+	if err := processTrack(context.Background(), testContextWithTransport(server), "https://chaturbate.com/test/", &ts); err != nil {
 		t.Fatalf("processTrack() error: %v", err)
 	}
 
@@ -66,7 +67,7 @@ func TestProcessTrackErrorsOnSkippedSequence(t *testing.T) {
 		name:   "video",
 	}
 	ctx := testContextWithTransport(server)
-	if err := processTrack(ctx, "https://chaturbate.com/test/", &ts); err != nil {
+	if err := processTrack(context.Background(), ctx, "https://chaturbate.com/test/", &ts); err != nil {
 		t.Fatalf("first processTrack() error: %v", err)
 	}
 
@@ -74,7 +75,7 @@ func TestProcessTrackErrorsOnSkippedSequence(t *testing.T) {
 		"seg2.m4s",
 	}))
 
-	err := processTrack(ctx, "https://chaturbate.com/test/", &ts)
+	err := processTrack(context.Background(), ctx, "https://chaturbate.com/test/", &ts)
 	if err == nil {
 		t.Fatal("expected skipped sequence error")
 	}
@@ -119,7 +120,7 @@ func TestAlignInitialTracksUsesClosestProgramDateTimes(t *testing.T) {
 		name:   "audio",
 	}
 
-	if err := alignInitialTracks(testContextWithTransport(server), "https://chaturbate.com/test/", &video, &audio); err != nil {
+	if err := alignInitialTracks(context.Background(), testContextWithTransport(server), "https://chaturbate.com/test/", &video, &audio); err != nil {
 		t.Fatalf("alignInitialTracks() error: %v", err)
 	}
 
@@ -325,6 +326,50 @@ func TestNextOutputPathUsesSequenceWhenBaseExists(t *testing.T) {
 	want := filepath.Join(dir, "testuser_1.mkv")
 	if got != want {
 		t.Fatalf("unexpected output path: got %q want %q", got, want)
+	}
+}
+
+func TestRecordMarksMasterRequestFailureForFastRetry(t *testing.T) {
+	ctx := testContext()
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return response(req, 503, "text/plain", []byte("unavailable")), nil
+	}))
+
+	res := record(ctx, config.ChannelConfig{
+		Username: "request_failure",
+		Pattern:  filepath.Join(t.TempDir(), "{{.Username}}"),
+	}, "https://stream.test/master.m3u8", context.Background())
+	if res.Status != StatusError || !res.FastRetry {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+func TestRecordCancellationStopsMasterRequest(t *testing.T) {
+	ctx := testContext()
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	}))
+	recordingCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	resultCh := make(chan Result, 1)
+	go func() {
+		resultCh <- record(ctx, config.ChannelConfig{
+			Username: "cancel_request",
+			Pattern:  filepath.Join(t.TempDir(), "{{.Username}}"),
+		}, "https://stream.test/master.m3u8", recordingCtx)
+	}()
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+
+	select {
+	case res := <-resultCh:
+		if res.Status != StatusCompleted {
+			t.Fatalf("status = %s, want completed", res.Status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("record did not return after cancellation")
 	}
 }
 

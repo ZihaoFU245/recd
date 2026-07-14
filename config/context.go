@@ -18,7 +18,7 @@ type AppContext struct {
 func NewAppContext(logger *slog.Logger, headers map[string]string) *AppContext {
 	client := resty.New().
 		SetHeader("User-Agent", DefaultUserAgent).
-		SetTimeout(30 * time.Second)
+		SetTimeout(10 * time.Second)
 	if headers != nil {
 		client.SetHeaders(headers)
 	}
