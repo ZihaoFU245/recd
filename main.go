@@ -17,7 +17,7 @@ import (
 
 func main() {
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
-	headersPath := flag.String("additional-headers", "", "path to JSON file with additional HTTP headers (key-value pairs)")
+	headersPath := flag.String("extra-headers", "", "path to JSON file with extra HTTP headers (key-value pairs)")
 	pidFile := flag.String("pid-file", "recd.pid", "path to PID file")
 	reload := flag.Bool("reload", false, "send SIGHUP to running recd process (reads --pid-file)")
 	flag.Parse()
@@ -62,7 +62,7 @@ func main() {
 	slog.SetDefault(logger)
 
 	if flag.NArg() < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: recd [--log-level=<level>] [--additional-headers=<path>] [--pid-file=<path>] <config.json>\n")
+		fmt.Fprintf(os.Stderr, "Usage: recd [--log-level=<level>] [--extra-headers=<path>] [--pid-file=<path>] <config.json>\n")
 		os.Exit(1)
 	}
 
@@ -96,7 +96,7 @@ func main() {
 			logger.Error("failed to parse headers file", "path", *headersPath, "error", err)
 			os.Exit(1)
 		}
-		logger.Info("loaded additional headers", "count", len(headers))
+		logger.Info("loaded extra headers", "count", len(headers))
 	}
 
 	allConfigs, err := config.ParseConfig(configPath)
