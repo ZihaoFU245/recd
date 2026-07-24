@@ -3,6 +3,7 @@ package channel
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 
 	"recd/config"
@@ -23,7 +24,6 @@ type Channel struct {
 
 	mu      sync.Mutex
 	started bool
-	active  bool
 }
 
 // New creates a recording session. supervisorDone lets a worker leave without
@@ -51,7 +51,6 @@ func (c *Channel) Run() {
 		return
 	}
 	c.started = true
-	c.active = true
 	c.mu.Unlock()
 
 	result := Result{Username: c.cfg.Username, Session: c.session}
@@ -59,12 +58,13 @@ func (c *Channel) Run() {
 		if panicValue := recover(); panicValue != nil {
 			result.Status = StatusError
 			result.Err = fmt.Errorf("panic: %v", panicValue)
-			c.ctx.Logger.Error("channel panic", "username", c.cfg.Username, "panic", panicValue)
+			c.ctx.Logger.Error("recorder goroutine panic recovered",
+				"username", c.cfg.Username,
+				"session", c.session,
+				"panic", panicValue,
+				"stack", string(debug.Stack()),
+			)
 		}
-
-		c.mu.Lock()
-		c.active = false
-		c.mu.Unlock()
 
 		if c.resultCh == nil {
 			return

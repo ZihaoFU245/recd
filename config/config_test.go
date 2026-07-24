@@ -11,7 +11,7 @@ import (
 
 func TestParseConfig(t *testing.T) {
 	channels := []ChannelConfig{
-		{IsPaused: false, Username: "test1", Framerate: 30, Resolution: 720, MaxDuration: 120},
+		{IsPaused: false, Username: "test1", Framerate: 30, Resolution: 720, Pattern: "videos/{{.Username}}", MaxDuration: 120},
 		{IsPaused: true, Username: "test2", Framerate: 60, Resolution: 1080, MaxDuration: 60},
 	}
 
@@ -58,6 +58,65 @@ func TestParseConfig_InvalidJSON(t *testing.T) {
 	_, err := ParseConfig(path)
 	if err == nil {
 		t.Error("expected error for invalid JSON")
+	}
+}
+
+func TestValidateConfigsRejectsInvalidRecordingInputs(t *testing.T) {
+	valid := ChannelConfig{
+		Username:   "valid_user1",
+		Resolution: 720,
+		Framerate:  30,
+		Pattern:    "videos/{{.Username}}",
+	}
+	tests := []struct {
+		name    string
+		configs []ChannelConfig
+		want    string
+	}{
+		{
+			name:    "hyphenated username",
+			configs: []ChannelConfig{{Username: "arcadian-platypus", Pattern: valid.Pattern}},
+			want:    "invalid username",
+		},
+		{
+			name:    "duplicate username",
+			configs: []ChannelConfig{valid, {Username: "VALID_USER1", Pattern: valid.Pattern}},
+			want:    "duplicates username",
+		},
+		{
+			name:    "empty pattern",
+			configs: []ChannelConfig{{Username: "valid_user"}},
+			want:    "empty output pattern",
+		},
+		{
+			name:    "invalid pattern",
+			configs: []ChannelConfig{{Username: "valid_user", Pattern: "{{"}},
+			want:    "invalid output pattern",
+		},
+		{
+			name:    "negative duration",
+			configs: []ChannelConfig{{Username: "valid_user", Pattern: valid.Pattern, MaxDuration: -1}},
+			want:    "negative max_duration",
+		},
+		{
+			name:    "negative filesize",
+			configs: []ChannelConfig{{Username: "valid_user", Pattern: valid.Pattern, MaxFilesize: -1}},
+			want:    "negative max_filesize",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateConfigs(test.configs)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ValidateConfigs() error = %v, want text %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateConfigsAllowsPausedEntryWithoutPattern(t *testing.T) {
+	if err := ValidateConfigs([]ChannelConfig{{Username: "paused_user", IsPaused: true}}); err != nil {
+		t.Fatalf("ValidateConfigs() error: %v", err)
 	}
 }
 

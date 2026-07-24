@@ -2,6 +2,8 @@ package monitor
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -81,7 +83,16 @@ func New(ctx *config.AppContext, configs []config.ChannelConfig) *Monitor {
 }
 
 func (m *Monitor) Run() {
-	defer close(m.doneCh)
+	defer func() {
+		if panicValue := recover(); panicValue != nil {
+			m.ctx.Logger.Error("monitor goroutine panic recovered",
+				"panic", panicValue,
+				"stack", string(debug.Stack()),
+			)
+			m.shutdown()
+		}
+		close(m.doneCh)
+	}()
 
 	m.ctx.Logger.Info("monitor watching channels", "count", len(m.configs))
 	m.mu.Lock()
@@ -97,18 +108,7 @@ func (m *Monitor) Run() {
 		m.tick()
 		select {
 		case <-m.stopCh:
-			m.cancel()
-			m.stopAll()
-			done := make(chan struct{})
-			go func() {
-				m.wg.Wait()
-				close(done)
-			}()
-			select {
-			case <-done:
-			case <-time.After(shutdownTimeout):
-				m.ctx.Logger.Warn("timed out waiting for recording sessions to stop")
-			}
+			m.shutdown()
 			return
 
 		case result := <-m.resultCh:
@@ -119,6 +119,21 @@ func (m *Monitor) Run() {
 
 		case <-ticker.C:
 		}
+	}
+}
+
+func (m *Monitor) shutdown() {
+	m.cancel()
+	m.stopAll()
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownTimeout):
+		m.ctx.Logger.Warn("timed out waiting for recording sessions to stop")
 	}
 }
 
@@ -144,13 +159,31 @@ func (m *Monitor) tick() {
 		m.wg.Add(1)
 		go func(username string) {
 			defer m.wg.Done()
-			online, hlsSource, err := m.checkStreamStatus(m.runCtx, username)
+			status := m.probeStreamStatus(username)
 			select {
-			case m.statusCh <- streamStatus{username: username, online: online, hlsSource: hlsSource, err: err}:
+			case m.statusCh <- status:
 			case <-m.stopCh:
 			}
 		}(username)
 	}
+}
+
+func (m *Monitor) probeStreamStatus(username string) (status streamStatus) {
+	status.username = username
+	defer func() {
+		if panicValue := recover(); panicValue != nil {
+			status.online = false
+			status.hlsSource = ""
+			status.err = fmt.Errorf("status probe panic: %v", panicValue)
+			m.ctx.Logger.Error("status probe goroutine panic recovered",
+				"username", username,
+				"panic", panicValue,
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+	status.online, status.hlsSource, status.err = m.checkStreamStatus(m.runCtx, username)
+	return status
 }
 
 func (m *Monitor) handleStatus(status streamStatus) {

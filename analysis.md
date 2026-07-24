@@ -1,263 +1,346 @@
-# Chaturbate Stream Analysis
+# Chaturbate Stream Discovery and HLS Analysis
 
-## Summary
+## Verification scope
 
-Analysis performed on:
-- **Online**: `https://chaturbate.com/angel_from_sky/`
-- **Offline**: `https://chaturbate.com/snow_is_falling/`
+This document was re-verified on **2026-07-24** with `curl` and the required
+user agent:
 
-Both pages return HTTP 200 with identical headers (Cloudflare CDN). Headers alone cannot distinguish online vs offline status.
+```text
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36
+```
 
----
+Observed fixtures and live test rooms:
 
-## 1. Detecting Online vs Offline
+| Role | Room | Observation |
+|---|---|---|
+| Offline fixture | `snow_is_falling` | `room_status="offline"`, empty `hls_source` |
+| Configured online fixture | `angel_from_sky` | Offline during this verification, so it could not validate live HLS |
+| Requested sample | `arcadian-platypus` | Invalid room identifier: Chaturbate usernames use letters, digits, and underscores; the hyphenated path returned 404 |
+| Live test | `ms_dira` | Public; room, master, video/audio playlists, init objects, and first complete segments returned HTTP 200 |
+| Live test | `onlykira` | Public; room, master, video/audio playlists, init objects, and first complete segments returned HTTP 200 |
+| Live test | `telladreamer_` | Public; room, master, video/audio playlists, init objects, and first complete segments returned HTTP 200 |
 
-### Method: Parse `window.initialRoomDossier`
+The room-list endpoint used to find a live target was:
 
-The HTML page embeds a JavaScript assignment containing a JSON string with all room data:
+```text
+GET https://chaturbate.com/api/ts/roomlist/room-list/
+X-Requested-With: XMLHttpRequest
+Referer: https://chaturbate.com/
+```
+
+Room availability, viewer counts, edge selection, stream IDs, renditions,
+bitrates, and playlist contents are transient. The tables below describe the
+verification snapshot, not a fixed service contract. No authentication token
+or session value is retained in this document.
+
+The valid room pages returned HTTP 200. Their response headers were
+not byte-for-byte identical (cookies and request-specific values differed), but
+ordinary status and response headers did not reveal whether a room was live.
+The HTML dossier is the useful source of room state.
+
+## 1. Detecting whether a room is recordable
+
+### `window.initialRoomDossier`
+
+The room HTML embeds a JavaScript string literal whose decoded value is JSON:
 
 ```html
 <script>
-  window.initialRoomDossier = "{\u0022viewer_uid\u0022: null, ...}";
+  window.initialRoomDossier = "{\u0022room_status\u0022: \u0022public\u0022, ...}";
 </script>
 ```
 
-**Key**: All JSON characters are Unicode-escaped (`\u0022` = `"`, `\u002D` = `-`, `\u003D` = `=`).
+This is two decoding layers:
 
-### Detection Strategies
+1. Parse the JavaScript-compatible quoted string.
+2. Parse the resulting text as JSON.
 
-| Field | Online Value | Offline Value |
-|-------|-------------|---------------|
-| `room_status` | `"public"` | `"offline"` |
-| `hls_source` | Full m3u8 URL (1101 chars) | `""` (empty) |
-| `num_viewers` | Active count (e.g. 2596) | Low count (e.g. 6) |
-| `edge_region` | e.g. `"SIN"` | `""` |
+Quotes and several HTML-sensitive characters are represented with `\u00XX`
+escapes, but it is inaccurate to say that every JSON character is Unicode
+escaped. Do not implement decoding as a global replacement of `\u00XX`
+sequences.
 
-**Recommended approach**: Extract `initialRoomDossier`, decode Unicode escapes, parse JSON, then check `room_status == "public"` **or** `hls_source != ""`. Combining both is most reliable.
+The closing quote must be found with an escape-aware scan. Searching for the
+first literal `";` is unsafe because a JSON string value can itself contain an
+escaped quote followed by a semicolon. The implementation in
+`monitor/streams.go` correctly skips escaped characters and then uses
+`strconv.Unquote` followed by `json.Unmarshal`.
 
-### Extraction algorithm (Go):
+### Start condition
 
-```
-1. Fetch https://chaturbate.com/{username}/ with UA header
-2. Find substring: window.initialRoomDossier = "
-3. Find closing: "; (double-quote semicolon)
-4. Decode \u00XX escape sequences (strconv.Unquote)
-5. json.Unmarshal into struct
-6. Read RoomStatus field
-```
+Fields relevant to recording are:
 
----
+| Field | Recordable public room | Offline room | Use |
+|---|---|---|---|
+| `room_status` | `"public"` | `"offline"` | Primary state |
+| `hls_source` | Authenticated master URL | `""` | Required input |
+| `num_viewers` | Any non-negative count | Often a small count | Metadata only |
+| `edge_region` | An edge code in this snapshot | `""` in both offline fixtures | Diagnostic metadata |
 
-## 2. Getting the m3u8 Master Playlist
+Start a recorder only when both conditions hold:
 
-### URL Extraction
-
-The `hls_source` field in `initialRoomDossier` contains the full master playlist URL:
-
-```
-https://edge13-sin.live.mmcdn.com/v1/edge/streams/origin.angel_from_sky.01KS5E9Z9KV6EEK0AYWDBYE06A/llhls.m3u8?token=eyJhbGciOiJSU0EtT0FFUC0yNTYi...
+```text
+room_status == "public" AND hls_source is not empty
 ```
 
-### URL Anatomy
+Using `OR` is unsafe: a non-public state must not be treated as recordable
+merely because a URL happens to be present, and `"public"` without a usable URL
+cannot be recorded. Viewer count and HTTP headers are not status indicators.
 
-| Component | Value | Notes |
-|-----------|-------|-------|
-| Edge host | `edge{N}-{region}.live.mmcdn.com` | N varies (13, 14...), region from `edge_region` field |
-| Stream path | `origin.{username}.{stream_id}` | `stream_id` is a 26-char ULID-like identifier |
-| Playlist file | `llhls.m3u8` | LL-HLS (Low-Latency HLS) |
-| Auth | `?token={jwe_token}` | JWE-encrypted token, short-lived |
+Recommended probe flow:
 
-### Token Lifetime
-
-The JWE token in the HTML is short-lived. After initial access with the token, the master playlist returns **session-based** sub-playlist URLs with a `?session={uuid}` parameter. The session UUID persists for the lifetime of the stream viewing session.
-
----
-
-## 3. Master Playlist Structure
-
-### Multi-Bitrate Variants
-
-The master playlist contains 6 quality levels:
-
-| Chunklist | Resolution | Bitrate | FPS |
-|-----------|-----------|---------|-----|
-| `chunklist_0_video` | 640x360 | 896 kbps | 30 |
-| `chunklist_1_video` | 852x480 | 1296 kbps | 30 |
-| `chunklist_2_video` | 960x540 | 2096 kbps | 30 |
-| `chunklist_3_video` | 1280x720 | 3296 kbps | 30 |
-| `chunklist_4_video` | 1280x720 | 4596 kbps | 60 |
-| `chunklist_5_video` | 1920x1080 | 7128 kbps | 30 |
-
-### Audio
-
-Separate audio chunklist, referenced via `#EXT-X-MEDIA` tag with group `audio_aac_{bitrate}`:
-- 128 kbps AAC (`audio_aac_128`)
-- 96 kbps AAC (`audio_aac_96`)
-
-### Variant Selection Logic
-
-To match the configured resolution, choose the variant with resolution height closest to the target:
-- **480p** -> `chunklist_1` (852x480)
-- **540p** -> `chunklist_2` (960x540)
-- **720p** -> `chunklist_3` (1280x720)
-- **1080p** -> `chunklist_5` (1920x1080)
-
----
-
-## 4. Chunklist (Sub-Playlist) Structure
-
-### Example (540p variant)
-
+```text
+1. GET https://chaturbate.com/{username}/ with the configured User-Agent.
+2. Require HTTP 200.
+3. Locate the initialRoomDossier assignment.
+4. Scan and decode its quoted JavaScript string.
+5. JSON-decode the result.
+6. Require room_status == "public" and hls_source != "".
 ```
-#EXTINF:1.600000s
-/v1/edge/streams/origin.{user}.{id}/seg_2_2005_video_{session_id}_llhls.m4s?session={session}
-#EXTINF:1.600000s
-/v1/edge/streams/origin.{user}.{id}/seg_2_2006_video_{session_id}_llhls.m4s?session={session}
+
+## 2. Master URL, token, and session behavior
+
+The live snapshot supplied a URL shaped like:
+
+```text
+https://edge22-mad.live.mmcdn.com/v1/edge/streams/
+origin.{username}.{stream_id}/llhls.m3u8?token={redacted}
+```
+
+Observed components:
+
+| Component | Observation |
+|---|---|
+| Host | `edge{number}-{region}.live.mmcdn.com`; both values may change |
+| Stream path | `origin.{username}.{stream_id}` |
+| Playlist | `llhls.m3u8` |
+| Query credential | `token={...}` |
+
+The token had five compact-JWE parts. Its decoded protected header declared
+`alg=RSA-OAEP-256` and `enc=A256GCM`. Treat the whole `hls_source` as an opaque
+credential: do not log it, persist it, edit it, or construct it manually.
+
+Two consecutive room-page fetches for the same live stream returned the same
+stream path but different tokens. The first GET of a fresh master URL returned
+HTTP 200 and child playlist URLs containing an opaque `session` query
+parameter. Repeating the same tokenized master request returned:
+
+```text
+HTTP 403
+x-reason: w3: session_duplicated
+```
+
+Therefore:
+
+- Consume a tokenized master URL once.
+- Resolve and retain the child playlist URLs returned by that successful
+  response; all entries in one master snapshot used the same session value.
+- A new room-page/master-token exchange created a different session.
+- Do not claim a fixed token or session lifetime from these observations.
+- If master acquisition fails, or an established session becomes unusable,
+  fetch the room page again and establish a fresh session. Do not retry the
+  same master token indefinitely.
+
+## 3. Master playlist
+
+The verified master was HLS version 6 with separate audio renditions:
+
+```text
+#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio_aac_128",...
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio_aac_96",...
+#EXT-X-STREAM-INF:...,RESOLUTION=640x360,...,AUDIO="audio_aac_96"
 ...
 ```
 
-### Key Properties
+### 2026-07-23 snapshot
 
-| Property | Value |
-|----------|-------|
-| Segment format | `.m4s` (fMP4 - fragmented MP4 for LL-HLS) |
-| Segment duration | ~1.6 seconds (varies slightly) |
-| Segment size | ~400 KB (540p), varies by resolution |
-| Window size | ~4 segments (LL-HLS keeps small sliding window) |
-| Partial segments | Supported (LL-HLS `#EXT-X-PART` tags may appear) |
+| Video index | Resolution | Declared bandwidth | Frame rate | Audio group |
+|---:|---:|---:|---:|---|
+| 0 | 640x360 | 896,000 | 30.020 | `audio_aac_96` |
+| 1 | 960x540 | 1,696,000 | 30.020 | `audio_aac_96` |
+| 2 | 1280x720 | 3,096,000 | 30.020 | `audio_aac_96` |
+| 3 | 1280x720 | 4,096,000 | 60.039 | `audio_aac_96` |
+| 4 | 1920x1080 | 7,128,000 | 60.039 | `audio_aac_128` |
 
-### Segment Naming
+This contradicts the earlier six-rendition table: this stream had no 480p
+variant, used different bandwidths, and exposed 1080p60 rather than 1080p30.
+Another broadcaster or encoder configuration may expose a different ladder.
 
+Never infer quality from `chunklist_N` alone. Parse every
+`#EXT-X-STREAM-INF`, select using its declared resolution/frame rate/bandwidth,
+and then follow the referenced audio group. Resolve child URIs against the
+master URL with a URL resolver rather than string concatenation.
+
+## 4. Media playlists and segments
+
+The selected 540p video and 96-kbit audio playlists both returned HTTP 200.
+The video snapshot contained:
+
+```text
+#EXT-X-TARGETDURATION:2
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=2.430000
+#EXT-X-PART-INF:PART-TARGET=0.799000
+#EXT-X-MEDIA-SEQUENCE:{sequence}
+#EXT-X-MAP:URI="...init...m4s?session={redacted}"
+#EXT-X-PROGRAM-DATE-TIME:...
+#EXTINF:1.632000,
+...seg...m4s?session={redacted}
+#EXT-X-PART:DURATION=0.799000,URI="...part...m4s?session={redacted}"
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="...part...m4s?session={redacted}"
 ```
-seg_{variant_idx}_{seq_num}_video_{id}_llhls.m4s?session={uuid}
+
+Observed properties:
+
+| Property | Snapshot observation |
+|---|---|
+| Complete segment format | Fragmented MP4 (`.m4s`), not MPEG-TS (`.ts`) |
+| Initialization | Separate `#EXT-X-MAP` object, required before media fragments |
+| Complete segment duration | About 1.6 seconds |
+| Partial segment duration | About 0.8 seconds, with occasional shorter tail parts |
+| Complete-segment window | Four segments in the sampled video playlist |
+| Timing | `#EXT-X-PROGRAM-DATE-TIME` on complete segments |
+| Synchronization | Separate audio and video playlists with close but non-identical boundaries |
+
+A freshly selected 540p segment was 330,652 bytes and had a `video/mp4`
+response; prepending its 671-byte init object allowed
+`ffprobe` to identify H.264 at 960x540 and 30 fps. Segment size varies with
+content and rendition, so it is not safe to assume a fixed 400 KB size.
+
+The sliding window is short. A segment from an earlier playlist returned 403
+after it had left the active window, while a segment selected immediately from
+the refreshed playlist returned 200. The collector must poll promptly, dedupe
+by media sequence, and treat a forward sequence gap as lost media rather than
+silently producing a complete-looking file.
+
+For the current full-segment implementation:
+
+```text
+1. Download the active EXT-X-MAP object before its media fragments and again
+   whenever its URI changes.
+2. Poll both video and audio media playlists.
+3. Download complete EXTINF segments that have not already been written.
+4. Do not also append EXT-X-PART objects; they overlap the later complete segment.
+5. Align initial audio/video using PROGRAM-DATE-TIME where available.
+6. Remux the separate tracks into the output container.
 ```
 
-- `variant_idx`: Quality level (0-5)
-- `seq_num`: Monotonically increasing sequence number
-- `id`: Numeric session identifier
-- `session`: UUID from master playlist response
+An `EXT-X-DISCONTINUITY` is logged. A changed segment map is downloaded before
+the affected segment. Neither case appeared in the live verification snapshot;
+the behavior is covered by synthetic tests.
 
-### Fetch Strategy
+## 5. HTTP behavior
 
-```
-1. GET master m3u8 (with Referer header)
-2. Parse variants, select target resolution
-3. GET chunklist m3u8 every tick interval
-4. Download new .m4s segments (keep track of seq_num to avoid duplicates)
-5. Append segments to output file
-```
+The project should send:
 
----
-
-## 5. HTTP Client Requirements
-
-### Required Headers
-
-```
-User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
+```text
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36
 Referer: https://chaturbate.com/{username}/
 ```
 
-The shared Go HTTP transport negotiates HTTP/2 whenever ALPN offers `h2`; the
-July 14 room-page and CDN master-playlist checks both used HTTP/2. HTTP/3 is not
-used.
+The user agent is a project requirement. Sending the room referer is a prudent
+compatibility policy and is what the recorder currently does. It is not
+accurate to call the referer demonstrably mandatory: in this verification,
+authenticated master, media-playlist, and current-segment requests also
+returned 200 when the referer was omitted.
 
-### Endpoints
+The anonymous checks did not share a cookie jar between the room page and CDN;
+the token/session query credentials were sufficient. That is an observation,
+not a guarantee that cookies or additional anti-bot handling will never be
+required.
 
-| Purpose | URL | Method |
-|---------|-----|--------|
-| Get room data | `https://chaturbate.com/{username}/` | GET |
-| Master playlist | From `hls_source` field | GET |
-| Chunklist | Relative URLs in master | GET (absolute via urljoin) |
-| Segments | Relative URLs in chunklist | GET (absolute via urljoin) |
+The verification requests used HTTP/2 explicitly. Responses advertised HTTP/3
+through `Alt-Svc`, but this does not mean the current Go client uses HTTP/3.
+Go's standard `net/http` transport can use HTTP/2 here; the code has no HTTP/3
+transport.
 
----
+Always validate HTTP status before parsing. In particular, a duplicate master
+token produced a small text error body rather than an HLS playlist. Content
+type is useful diagnostic evidence but should not replace parsing and status
+checks.
 
-## 6. Implementation Notes
+## 6. Recorder implementation audit
 
-### Unicode Decoding
+The implementation is one Go process with goroutines, not one OS process per
+channel. Each active target gets one `channel.Channel` goroutine; `ffmpeg` is
+the external subprocess used for direct HLS capture or final remuxing.
 
-The `initialRoomDossier` string uses `\u00XX` escape sequences for all special characters. In Go, use:
+Verified behavior in the current code:
 
-```go
-decoded, err := strconv.Unquote(`"` + escapedJSON + `"`)
+- `monitor.checkStreamStatus` uses the safe dossier parser and requires
+  `room_status == "public" && hls_source != ""`.
+- Status probes run independently without holding the monitor state mutex
+  during network I/O.
+- A numbered session/generation prevents a late result from an old worker from
+  stopping or rescheduling a newer worker.
+- The shared Resty client has the required default user agent and a 10-second
+  timeout. Recorder requests also carry their recording context and referer.
+- `fetchAndSelectVariant` parses the master, chooses the closest resolution
+  height, and uses configured frame rate to choose among equally close
+  resolutions. It resolves both video and matching separate-audio URLs.
+- For separate audio/video playlists, `recordWithTempFiles` aligns initial
+  complete segments by program time, downloads unseen full segments, errors on
+  a sequence gap, enforces duration and combined-track byte limits, and remuxes
+  the two temporary fMP4 tracks to MKV.
+- For a media playlist without separate audio,
+  `recordWithFFmpegHLS` lets `ffmpeg` read HLS and stream-copy to MKV.
+- Optional `RECD_SEGMENT_CACHE_DIR` caching records init/media objects plus a
+  JSONL manifest with sanitized URI/path, size, SHA-256, duration, and program
+  time. Signed query credentials are not logged or retained in the manifest.
+- Debug logging reports room status, selected rendition metadata, playlist
+  sequence/count, sanitized request paths and status codes, and each committed
+  segment without exposing token/session query strings.
+- Terminal statuses are `completed`, `max_duration`, `max_filesize`, `error`,
+  `desync`, and `ended`. `ended` is treated as an unexpected recorder exit.
+
+### Current limitations
+
+1. **Encrypted and byte-range media are not implemented by the Go segment
+   downloader.** The verified live streams were unencrypted standalone fMP4
+   objects.
+2. **Session recovery occurs outside the recorder.** A request failure exits
+   the recording attempt so the monitor can probe the room again. The recorder
+   should not reuse the consumed master token itself.
+3. **Temporary files are intentionally retained on failed/empty remuxes for
+   diagnosis.** They are removed after a successful merge.
+
+On the separate-track path, maximum file size is checked after complete
+segments are written and uses the combined bytes captured for the two tracks.
+The threshold can therefore be exceeded by the final pair of segments, and MKV
+container overhead means the final output size need not exactly equal the
+captured fMP4 byte count.
+
+Only network errors, HTTP 408/429, and 5xx responses are retried once against
+the same media URL. Expired 403/404 segment URLs are not retried; the recorder
+returns to the monitor for a fresh room/session probe.
+
+Retry behavior is contextual: an offline room is checked every 15 seconds; a
+live recording is checked every 30 seconds; status faults while idle and
+request-class recorder failures back off from 1 second to a 15-second cap;
+status faults during an active recording retry after 5 seconds; other recorder
+failures wait 30 seconds before a new probe.
+
+## 7. Collector flow
+
+The resulting end-to-end design is:
+
+```text
+master process
+  -> parse configured targets
+  -> monitor each room page
+  -> decode initialRoomDossier
+  -> require public status plus hls_source
+  -> start one channel goroutine
+  -> consume the tokenized master URL once
+  -> select video resolution/frame rate and matching audio rendition
+  -> poll short LL-HLS windows
+  -> download init objects and unseen complete .m4s fragments
+  -> remux tracks to MKV
+  -> on loss/auth/session failure, return to a fresh room-page probe
 ```
 
-Then `json.Unmarshal` the result.
-
-### Concurrent Safety
-
-- The JWE token in `hls_source` authenticates the master playlist fetch
-- After that, all sub-playlists use the `session` UUID
-- The session UUID is stable; re-use it for all chunklist/segment requests
-- If segments return 403/404, re-fetch the page for a fresh `initialRoomDossier`
-
-### Anti-Blocking
-
-- Use the Chrome UA from AGENTS.md
-- Always include `Referer: https://chaturbate.com/{username}/`
-- Respect the CDN edge region (don't hardcode edge hostname)
-
----
-
-## 7. Worker Recorder Process
-
-The worker side is the `channel` package. The monitor starts one `Channel`
-goroutine per online target, and that goroutine owns exactly one recording
-session for the configured username.
-
-### Lifecycle
-
-1. The monitor creates one numbered `channel.Channel` session for each online target.
-2. `Channel.Run` marks the channel active and calls `record(...)`.
-3. `record` chooses a non-conflicting output path from the configured pattern,
-   fetches the master playlist from `hls_source`, selects the closest video
-   variant to `cfg.Resolution`, and checks whether the selected variant has a
-   separate audio rendition.
-4. The recorder runs one of two capture paths:
-   - `recordWithFFmpegHLS` for a single HLS media playlist. `ffmpeg` reads the
-     playlist directly with the required UA and `Referer` headers and remuxes to
-     MKV with `-c copy`.
-   - `recordWithTempFiles` for separate audio/video fMP4 playlists. The worker
-     polls both media playlists, downloads only unseen segments, writes each
-     track to a temp file, then merges the temp video/audio files into the final
-     MKV with `ffmpeg`.
-5. When recording ends, `Channel.Run` sends a `Result` back to the monitor.
-   Normal end states are `completed`, `max_duration`, and `max_filesize`.
-   Unexpected recorder failures use `error`; excessive audio/video drift uses
-   `desync`.
-
-### Stop, Reload, and Recovery
-
-- Each session has one cancellable context. Stopping a channel cancels its
-  master-playlist, media-playlist, and segment requests immediately.
-- Reload removes the old numbered session before scheduling a fresh probe. A
-  late result includes its session number and therefore cannot stop or retry a
-  newer recording.
-- The monitor performs room probes independently, rather than holding its state
-  lock during HTTP. HTTP request faults retry after 1s with a 15s cap;
-  unexpected recorder termination waits 30s before a new probe.
-
-### Segment Handling
-
-- Each `trackState` stores the media playlist URL, output writer, last sequence
-  number, init-segment state, cumulative duration, and first/last
-  `EXT-X-PROGRAM-DATE-TIME`.
-- `alignInitialTracks` uses program date times to choose the closest initial
-  audio/video segment pair before any bytes are written. This reduces startup
-  A/V offset for separate tracks.
-- `processTrackSegments` skips already-recorded sequence numbers and errors if
-  the next visible sequence jumps ahead, because that means the LL-HLS sliding
-  window moved before the worker downloaded all segments.
-- Optional segment caching is controlled by `RECD_SEGMENT_CACHE_DIR`; when set,
-  downloaded init segments and media segments are written with a JSONL manifest
-  containing track, sequence, URI, size, hash, duration, and program time.
-
-### Bugs Fixed in This Pass
-
-- Shared Resty clients use the required Chrome User-Agent by default and have a
-  finite 10-second timeout.
-- Session results are generation-safe, so an old worker cannot disturb a newer
-  worker after reload or a quick restart.
-- All recorder HTTP work uses the session context, not just master-playlist
-  selection.
+The original requirement's reference to downloading many `.ts` segments does
+not match the verified upstream format. The collector currently receives many
+fragmented-MP4 `.m4s` objects, often as separate video and audio tracks.

@@ -130,9 +130,6 @@ func TestAlignInitialTracksUsesClosestProgramDateTimes(t *testing.T) {
 	if got, want := audioOut.String(), "ainit|a200|a201|a202|"; got != want {
 		t.Fatalf("unexpected audio output: got %q want %q", got, want)
 	}
-	if video.firstPDT.Sub(audio.firstPDT) != 300*time.Millisecond {
-		t.Fatalf("unexpected first program time offset: video=%s audio=%s", video.firstPDT, audio.firstPDT)
-	}
 	if video.lastSeq != 102 || audio.lastSeq != 202 {
 		t.Fatalf("unexpected last seq: video=%d audio=%d", video.lastSeq, audio.lastSeq)
 	}
@@ -146,6 +143,314 @@ func TestChooseAlignedStartReturnsFalseWithoutProgramDateTimes(t *testing.T) {
 	})
 	if ok {
 		t.Fatal("expected no alignment without program date times")
+	}
+}
+
+func TestMaxDurationReachedUsesMediaDuration(t *testing.T) {
+	if maxDurationReached(1, 59.9, 59.8) {
+		t.Fatal("duration limit reached too early")
+	}
+	if !maxDurationReached(1, 60.1, 59.9) {
+		t.Fatal("duration limit should use the longest recorded track")
+	}
+	if maxDurationReached(0, 600) {
+		t.Fatal("zero max duration should disable the limit")
+	}
+}
+
+func TestMaxFilesizeReachedUsesCombinedTrackSize(t *testing.T) {
+	if maxFilesizeReached(100, 40, 59) {
+		t.Fatal("filesize limit reached too early")
+	}
+	if !maxFilesizeReached(100, 40, 60) {
+		t.Fatal("combined track size should reach the limit")
+	}
+	if maxFilesizeReached(0, 1000) {
+		t.Fatal("zero max filesize should disable the limit")
+	}
+}
+
+func TestRecordWithTempFilesStopsAtMaxFilesize(t *testing.T) {
+	server := newSegmentServer(map[string][]byte{
+		"/vinit.mp4": []byte("vinit"),
+		"/ainit.mp4": []byte("ainit"),
+		"/v0.m4s":    []byte("video-segment"),
+		"/a0.m4s":    []byte("audio-segment"),
+	})
+	server.setPlaylist("/video.m3u8", mediaPlaylistWithMap(0, "vinit.mp4", []string{"v0.m4s"}))
+	server.setPlaylist("/audio.m3u8", mediaPlaylistWithMap(0, "ainit.mp4", []string{"a0.m4s"}))
+
+	oldMerge := mergeMediaFiles
+	t.Cleanup(func() { mergeMediaFiles = oldMerge })
+	var mergeCalled bool
+	mergeMediaFiles = func(_ *config.AppContext, _, _, _, outputPath string, _, _ int64) error {
+		mergeCalled = true
+		return os.WriteFile(outputPath, []byte("merged"), 0644)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "out.mkv")
+	res := recordWithTempFiles(
+		context.Background(),
+		testContextWithTransport(server),
+		config.ChannelConfig{Username: "size_limit", MaxFilesize: 30},
+		server.URL+"/video.m3u8",
+		server.URL+"/audio.m3u8",
+		"https://chaturbate.com/size_limit/",
+		outputPath,
+		time.Now(),
+	)
+
+	if res.Status != StatusMaxFilesize {
+		t.Fatalf("status = %s, want max_filesize", res.Status)
+	}
+	if !mergeCalled {
+		t.Fatal("expected captured tracks to be merged")
+	}
+	if res.Filesize == 0 {
+		t.Fatal("expected a non-empty output")
+	}
+}
+
+func TestSelectVariantUsesFramerateAfterResolution(t *testing.T) {
+	master := &m3u8.MasterPlaylist{Variants: []*m3u8.Variant{
+		{
+			URI: "720p30.m3u8",
+			VariantParams: m3u8.VariantParams{
+				Resolution: "1280x720",
+				FrameRate:  30.020,
+			},
+		},
+		{
+			URI: "720p60.m3u8",
+			VariantParams: m3u8.VariantParams{
+				Resolution: "1280x720",
+				FrameRate:  60.039,
+			},
+		},
+		{
+			URI: "1080p60.m3u8",
+			VariantParams: m3u8.VariantParams{
+				Resolution: "1920x1080",
+				FrameRate:  60.039,
+			},
+		},
+	}}
+
+	if got := selectVariant(master, 720, 60); got == nil || got.URI != "720p60.m3u8" {
+		t.Fatalf("720p60 selection = %#v", got)
+	}
+	if got := selectVariant(master, 720, 30); got == nil || got.URI != "720p30.m3u8" {
+		t.Fatalf("720p30 selection = %#v", got)
+	}
+	if got := selectVariant(master, 1080, 30); got == nil || got.URI != "1080p60.m3u8" {
+		t.Fatalf("resolution should take priority over framerate, got %#v", got)
+	}
+	if got := selectVariant(master, 720, 0); got == nil || got.URI != "720p30.m3u8" {
+		t.Fatalf("zero target framerate should preserve master order, got %#v", got)
+	}
+}
+
+func TestSelectVariantIgnoresInvalidResolution(t *testing.T) {
+	master := &m3u8.MasterPlaylist{Variants: []*m3u8.Variant{
+		{URI: "invalid.m3u8", VariantParams: m3u8.VariantParams{Resolution: "invalid"}},
+		{URI: "valid.m3u8", VariantParams: m3u8.VariantParams{Resolution: "960x540"}},
+	}}
+
+	if got := selectVariant(master, 540, 30); got == nil || got.URI != "valid.m3u8" {
+		t.Fatalf("selection = %#v, want valid variant", got)
+	}
+}
+
+func TestSelectVariantFallsBackWhenResolutionMetadataIsMissing(t *testing.T) {
+	master := &m3u8.MasterPlaylist{Variants: []*m3u8.Variant{
+		{URI: "fallback.m3u8"},
+		{URI: "also-invalid.m3u8", VariantParams: m3u8.VariantParams{Resolution: "unknown"}},
+	}}
+	if got := selectVariant(master, 720, 30); got == nil || got.URI != "fallback.m3u8" {
+		t.Fatalf("selection = %#v, want first playable fallback", got)
+	}
+}
+
+func TestResolveURLHandlesHLSReferencesWithoutChangingQueries(t *testing.T) {
+	base := "https://edge.example.test/v1/stream/master.m3u8?token=secret"
+	tests := map[string]string{
+		"/v1/stream/video.m3u8?session=abc": "https://edge.example.test/v1/stream/video.m3u8?session=abc",
+		"video.m3u8?session=abc":            "https://edge.example.test/v1/stream/video.m3u8?session=abc",
+		"https://cdn.example.test/v.m3u8":   "https://cdn.example.test/v.m3u8",
+	}
+	for reference, want := range tests {
+		got, err := resolveURL(base, reference)
+		if err != nil {
+			t.Fatalf("resolveURL(%q) error: %v", reference, err)
+		}
+		if got != want {
+			t.Fatalf("resolveURL(%q) = %q, want %q", reference, got, want)
+		}
+	}
+}
+
+func TestResolveURLRejectsValuesThatWouldCreateFalsePaths(t *testing.T) {
+	for _, reference := range []string{"", `"/v1/stream/init.m4s"`, "file:///tmp/media.m3u8"} {
+		if got, err := resolveURL("https://edge.example.test/master.m3u8", reference); err == nil {
+			t.Fatalf("resolveURL(%q) = %q, want error", reference, got)
+		}
+	}
+	if got, err := resolveURL("not-an-absolute-url", "video.m3u8"); err == nil {
+		t.Fatalf("resolveURL() = %q, want invalid base error", got)
+	}
+}
+
+func TestSafeURLRemovesCredentialsAndQuery(t *testing.T) {
+	got := safeURL("https://user:pass@edge.example.test/video.m3u8?token=secret#fragment")
+	if want := "https://edge.example.test/video.m3u8"; got != want {
+		t.Fatalf("safeURL() = %q, want %q", got, want)
+	}
+}
+
+func TestSafeReferenceRemovesQueryFromRelativeURI(t *testing.T) {
+	got := safeReference("../seg.m4s?session=secret#fragment")
+	if want := "../seg.m4s"; got != want {
+		t.Fatalf("safeReference() = %q, want %q", got, want)
+	}
+}
+
+func TestProcessTrackRecordsChangedInitializationMap(t *testing.T) {
+	server := newSegmentServer(map[string][]byte{
+		"/init-a.mp4": []byte("init-a|"),
+		"/init-b.mp4": []byte("init-b|"),
+		"/seg0.m4s":   []byte("seg0|"),
+		"/seg1.m4s":   []byte("seg1|"),
+	})
+	server.setPlaylist("/video.m3u8", mediaPlaylistWithMap(0, "init-a.mp4", []string{"seg0.m4s"}))
+
+	var out bytes.Buffer
+	ts := trackState{
+		url:    server.URL + "/video.m3u8",
+		writer: nopWriteCloser{&out},
+		name:   "video",
+	}
+	ctx := testContextWithTransport(server)
+	if err := processTrack(context.Background(), ctx, "https://chaturbate.com/test/", &ts); err != nil {
+		t.Fatalf("first processTrack() error: %v", err)
+	}
+
+	server.setPlaylist("/video.m3u8", mediaPlaylistWithMap(1, "init-b.mp4", []string{"seg1.m4s"}))
+	if err := processTrack(context.Background(), ctx, "https://chaturbate.com/test/", &ts); err != nil {
+		t.Fatalf("second processTrack() error: %v", err)
+	}
+	if got, want := out.String(), "init-a|seg0|init-b|seg1|"; got != want {
+		t.Fatalf("recorded bytes = %q, want %q", got, want)
+	}
+}
+
+func TestProcessTrackDoesNotRetryExpiredSegment(t *testing.T) {
+	server := newSegmentServer(map[string][]byte{
+		"/init.mp4": []byte("init"),
+	})
+	server.setPlaylist("/video.m3u8", mediaPlaylist(0, []string{"expired.m4s"}))
+
+	var out bytes.Buffer
+	ts := trackState{
+		url:      server.URL + "/video.m3u8",
+		writer:   nopWriteCloser{&out},
+		name:     "video",
+		username: "test",
+	}
+	err := processTrack(context.Background(), testContextWithTransport(server), "https://chaturbate.com/test/", &ts)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("processTrack() error = %v, want HTTP 404", err)
+	}
+	if got := server.requests["/expired.m4s"]; got != 1 {
+		t.Fatalf("expired segment requests = %d, want 1", got)
+	}
+}
+
+func TestProcessTrackRetriesFetchBeforeWritingOnce(t *testing.T) {
+	var segmentRequests int
+	ctx := testContext()
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/video.m3u8":
+			return response(req, 200, "application/vnd.apple.mpegurl", []byte(mediaPlaylist(0, []string{"seg0.m4s"}))), nil
+		case "/init.mp4":
+			return response(req, 200, "video/mp4", []byte("init|")), nil
+		case "/seg0.m4s":
+			segmentRequests++
+			if segmentRequests == 1 {
+				return response(req, 503, "text/plain", []byte("retry")), nil
+			}
+			return response(req, 200, "video/mp4", []byte("segment|")), nil
+		default:
+			return response(req, 404, "text/plain", nil), nil
+		}
+	}))
+
+	var out bytes.Buffer
+	ts := trackState{
+		url:      "https://segments.test/video.m3u8",
+		writer:   nopWriteCloser{&out},
+		name:     "video",
+		username: "test",
+	}
+	if err := processTrack(context.Background(), ctx, "https://chaturbate.com/test/", &ts); err != nil {
+		t.Fatalf("processTrack() error: %v", err)
+	}
+	if segmentRequests != 2 {
+		t.Fatalf("segment requests = %d, want 2", segmentRequests)
+	}
+	if got, want := out.String(), "init|segment|"; got != want {
+		t.Fatalf("recorded bytes = %q, want %q", got, want)
+	}
+}
+
+func TestFetchMediaPlaylistRetriesTransientFailure(t *testing.T) {
+	var playlistRequests int
+	ctx := testContext()
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		playlistRequests++
+		if playlistRequests == 1 {
+			return response(req, http.StatusServiceUnavailable, "text/plain", []byte("retry")), nil
+		}
+		return response(
+			req,
+			http.StatusOK,
+			"application/vnd.apple.mpegurl",
+			[]byte(mediaPlaylist(0, []string{"seg0.m4s"})),
+		), nil
+	}))
+
+	ts := trackState{
+		url:      "https://segments.test/video.m3u8",
+		name:     "video",
+		username: "test",
+	}
+	if _, err := fetchMediaPlaylist(context.Background(), ctx, "https://chaturbate.com/test/", &ts); err != nil {
+		t.Fatalf("fetchMediaPlaylist() error: %v", err)
+	}
+	if playlistRequests != 2 {
+		t.Fatalf("playlist requests = %d, want 2", playlistRequests)
+	}
+}
+
+func TestFetchMediaPlaylistDoesNotRetryExpiredURL(t *testing.T) {
+	var playlistRequests int
+	ctx := testContext()
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		playlistRequests++
+		return response(req, http.StatusNotFound, "text/plain", []byte("expired")), nil
+	}))
+
+	ts := trackState{
+		url:      "https://segments.test/video.m3u8",
+		name:     "video",
+		username: "test",
+	}
+	_, err := fetchMediaPlaylist(context.Background(), ctx, "https://chaturbate.com/test/", &ts)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("fetchMediaPlaylist() error = %v, want HTTP 404", err)
+	}
+	if playlistRequests != 1 {
+		t.Fatalf("playlist requests = %d, want 1", playlistRequests)
 	}
 }
 
@@ -186,6 +491,30 @@ func TestCacheDownloadedSegmentWritesBodyAndManifest(t *testing.T) {
 	}
 	if !bytes.Equal(cachedBody, body) {
 		t.Fatalf("cached body mismatch: got %q want %q", cachedBody, body)
+	}
+}
+
+func TestCacheDownloadedSegmentRedactsSignedURLs(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("RECD_SEGMENT_CACHE_DIR", cacheDir)
+
+	entry := segmentCacheEntry{
+		Username: "test",
+		Track:    "video",
+		Kind:     "segment",
+		Seq:      1,
+		URI:      "seg.m4s?session=secret",
+		URL:      "https://user:pass@segments.test/seg.m4s?token=secret#part",
+	}
+	if err := cacheDownloadedSegment(&trackState{}, entry, []byte("body")); err != nil {
+		t.Fatalf("cacheDownloadedSegment() error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(cacheDir, "test", "manifest.jsonl"))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if bytes.Contains(data, []byte("secret")) || bytes.Contains(data, []byte("user:pass")) {
+		t.Fatalf("manifest contains credential material: %s", data)
 	}
 }
 
@@ -329,6 +658,22 @@ func TestNextOutputPathUsesSequenceWhenBaseExists(t *testing.T) {
 	}
 }
 
+func TestNextOutputPathAddsSequenceWhenPatternDoesNot(t *testing.T) {
+	dir := t.TempDir()
+	pattern := filepath.Join(dir, "{{.Username}}")
+	start := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	writeTestFile(t, dir, "testuser.mkv", []byte("existing"))
+
+	got, err := nextOutputPath(pattern, "testuser", start)
+	if err != nil {
+		t.Fatalf("nextOutputPath() error: %v", err)
+	}
+	want := filepath.Join(dir, "testuser_1.mkv")
+	if got != want {
+		t.Fatalf("unexpected output path: got %q want %q", got, want)
+	}
+}
+
 func TestRecordMarksMasterRequestFailureForFastRetry(t *testing.T) {
 	ctx := testContext()
 	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -383,6 +728,7 @@ type segmentServer struct {
 	URL       string
 	bodies    map[string][]byte
 	playlists map[string]string
+	requests  map[string]int
 }
 
 func newSegmentServer(bodies map[string][]byte) *segmentServer {
@@ -390,6 +736,7 @@ func newSegmentServer(bodies map[string][]byte) *segmentServer {
 		URL:       "https://segments.test",
 		bodies:    bodies,
 		playlists: make(map[string]string),
+		requests:  make(map[string]int),
 	}
 }
 
@@ -400,6 +747,7 @@ func (s *segmentServer) setPlaylist(path, body string) {
 func testContextWithTransport(server *segmentServer) *config.AppContext {
 	ctx := testContext()
 	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		server.requests[req.URL.Path]++
 		if playlist, ok := server.playlists[req.URL.Path]; ok {
 			return response(req, 200, "application/vnd.apple.mpegurl", []byte(playlist)), nil
 		}

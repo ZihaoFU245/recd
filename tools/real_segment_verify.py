@@ -141,19 +141,33 @@ def build_binary(repo, work):
     return binary
 
 
-def run_recorder(repo, binary, usernames, resolution, duration, work, cache_root):
+def run_recorder(
+    repo,
+    binary,
+    usernames,
+    resolution,
+    duration,
+    work,
+    cache_root,
+    log_level,
+    output_dir,
+):
     config_path = work / "config.json"
     pid_path = work / "recd.pid"
+    output_dir.mkdir(parents=True, exist_ok=True)
     config = []
     for username in usernames:
-        pattern = f"videos/verify_segments_{sanitize(username)}_{{{{.Year}}}}-{{{{.Month}}}}-{{{{.Day}}}}_{{{{.Hour}}}}-{{{{.Minute}}}}-{{{{.Second}}}}"
+        pattern = (
+            output_dir
+            / f"verify_segments_{sanitize(username)}_{{{{.Year}}}}-{{{{.Month}}}}-{{{{.Day}}}}_{{{{.Hour}}}}-{{{{.Minute}}}}-{{{{.Second}}}}"
+        )
         config.append(
             {
                 "is_paused": False,
                 "username": username,
                 "framerate": 30,
                 "resolution": resolution,
-                "pattern": pattern,
+                "pattern": str(pattern),
                 "max_duration": 0,
                 "max_filesize": 0,
                 "created_at": 0,
@@ -165,32 +179,35 @@ def run_recorder(repo, binary, usernames, resolution, duration, work, cache_root
     env["RECD_SEGMENT_CACHE_DIR"] = str(cache_root)
     cmd = [
         str(binary),
-        "--log-level=info",
+        f"--log-level={log_level}",
         "--pid-file",
         str(pid_path),
         str(config_path),
     ]
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    try:
-        time.sleep(duration)
-        proc.send_signal(signal.SIGINT)
-        output, _ = proc.communicate(timeout=90)
-    except Exception:
-        proc.kill()
-        output, _ = proc.communicate(timeout=30)
-        raise
-
     log_path = work / "run.log"
-    log_path.write_text(output)
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo,
+            env=env,
+            text=True,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            time.sleep(duration)
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=90)
+        except Exception:
+            proc.kill()
+            proc.wait(timeout=30)
+            raise
+
+    output = log_path.read_text()
     if proc.returncode != 0:
-        raise RuntimeError(f"recorder exited {proc.returncode}; log at {log_path}\n{output}")
+        raise RuntimeError(
+            f"recorder exited {proc.returncode}; log at {log_path}\n{output[-12000:]}"
+        )
 
     output_paths = {}
     for username in usernames:
@@ -198,9 +215,14 @@ def run_recorder(repo, binary, usernames, resolution, duration, work, cache_root
         if matches:
             output_paths[username] = repo / matches[-1]
             continue
-        candidates = sorted((repo / "videos").glob(f"verify_segments_{sanitize(username)}_*.mkv"))
+        candidates = sorted(
+            output_dir.glob(f"verify_segments_{sanitize(username)}_*.mkv")
+        )
         if not candidates:
-            raise RuntimeError(f"no output path found for {username}; log at {log_path}\n{output}")
+            raise RuntimeError(
+                f"no output path found for {username}; log at {log_path}\n"
+                f"{output[-12000:]}"
+            )
         output_paths[username] = candidates[-1]
     return output_paths, log_path, output
 
@@ -249,23 +271,52 @@ def main():
     parser.add_argument(
         "--username",
         action="append",
-        default=[],
+        required=True,
         help="channel username; pass more than once to test concurrent recording",
     )
     parser.add_argument("--resolution", type=int, default=480)
     parser.add_argument("--duration", type=int, default=60)
+    parser.add_argument(
+        "--log-level",
+        choices=["debug", "info", "warn", "error"],
+        default="debug",
+    )
     parser.add_argument("--work-dir", default="")
+    parser.add_argument(
+        "--output-dir",
+        default="",
+        help="directory for verified MKV files; defaults to a temporary work directory",
+    )
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parents[1]
-    work = Path(args.work_dir) if args.work_dir else Path(tempfile.mkdtemp(prefix="recd-real-verify-"))
-    work.mkdir(parents=True, exist_ok=True)
+    if args.work_dir:
+        work_root = Path(args.work_dir)
+        work_root.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="run-", dir=work_root))
+    else:
+        work = Path(tempfile.mkdtemp(prefix="recd-real-verify-"))
     cache_root = work / "segment-cache"
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+        if not output_dir.is_absolute():
+            output_dir = repo / output_dir
+        output_dir = output_dir.resolve()
+    else:
+        output_dir = work / "outputs"
 
-    usernames = args.username or ["chloe_show"]
+    usernames = args.username
     binary = build_binary(repo, work)
     output_paths, log_path, _ = run_recorder(
-        repo, binary, usernames, args.resolution, args.duration, work, cache_root
+        repo,
+        binary,
+        usernames,
+        args.resolution,
+        args.duration,
+        work,
+        cache_root,
+        args.log_level,
+        output_dir,
     )
 
     reports = []

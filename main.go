@@ -122,7 +122,15 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	for sig := range sigCh {
+	for {
+		var sig os.Signal
+		select {
+		case <-mon.Done():
+			logger.Error("monitor stopped unexpectedly")
+			return
+		case sig = <-sigCh:
+		}
+
 		switch sig {
 		case syscall.SIGHUP:
 			newAllConfigs, err := config.ParseConfig(configPath)

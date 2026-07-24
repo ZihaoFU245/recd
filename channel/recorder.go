@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -40,20 +43,30 @@ type trackState struct {
 	writer      io.WriteCloser
 	lastSeq     uint64
 	haveLastSeq bool
-	wroteInit   bool
+	initURL     string
 	duration    float64
-	firstPDT    time.Time
-	lastPDT     time.Time
+	size        int64
 	username    string
 	name        string
 }
 
-// requestError marks a failed HTTP operation. The monitor uses it to restart
-// quickly, unlike a recorder process that simply exits on its own.
-type requestError struct{ err error }
+// requestError marks a failure that should make the monitor obtain fresh room
+// state quickly. HTTP failures also carry a status used to decide whether one
+// retry of the same URL is safe.
+type requestError struct {
+	err    error
+	status int
+}
 
 func (e *requestError) Error() string { return e.err.Error() }
 func (e *requestError) Unwrap() error { return e.err }
+
+func (e *requestError) retrySameURL() bool {
+	return e.status == 0 ||
+		e.status == http.StatusRequestTimeout ||
+		e.status == http.StatusTooManyRequests ||
+		e.status >= 500
+}
 
 type segmentCacheEntry struct {
 	Username        string `json:"username"`
@@ -103,10 +116,7 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string, 
 			res.Path = outputPath
 			return
 		}
-		res.Status = StatusError
-		res.Err = fmt.Errorf("variant selection: %w", err)
-		var requestErr *requestError
-		res.FastRetry = errors.As(err, &requestErr)
+		setRecordError(&res, fmt.Errorf("variant selection: %w", err))
 		return
 	}
 
@@ -119,11 +129,23 @@ func record(ctx *config.AppContext, cfg config.ChannelConfig, hlsSource string, 
 }
 
 func nextOutputPath(pattern, username string, start time.Time) (string, error) {
+	compiled, err := config.CompilePathPattern(pattern)
+	if err != nil {
+		return "", fmt.Errorf("pattern expansion: %w", err)
+	}
+	seen := make(map[string]struct{})
 	for seq := 0; seq < maxOutputPathTries; seq++ {
-		path, err := config.ExpandPattern(pattern, config.PathVars(username, start, seq))
+		path, err := compiled.Expand(config.PathVars(username, start, seq))
 		if err != nil {
 			return "", fmt.Errorf("pattern expansion: %w", err)
 		}
+		if strings.TrimSpace(path) == "" {
+			return "", fmt.Errorf("pattern expansion produced an empty path")
+		}
+		if _, repeated := seen[path]; repeated {
+			path += "_" + strconv.Itoa(seq)
+		}
+		seen[path] = struct{}{}
 		path += ".mkv"
 
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
@@ -135,21 +157,22 @@ func nextOutputPath(pattern, username string, start time.Time) (string, error) {
 	return "", fmt.Errorf("no available output path after %d attempts", maxOutputPathTries)
 }
 
+func setRecordError(res *Result, err error) {
+	res.Status = StatusError
+	res.Err = err
+	var requestErr *requestError
+	res.FastRetry = errors.As(err, &requestErr)
+}
+
 func recordWithFFmpegHLS(recordingCtx context.Context, ctx *config.AppContext, cfg config.ChannelConfig, videoChunkURL, referer, outputPath string, t0 time.Time) (res Result) {
 	res.Username = cfg.Username
 
-	args := []string{"-hide_banner", "-loglevel", "warning"}
-	appendInput := func(inputURL string) {
-		args = append(args,
-			"-user_agent", ffmpegUserAgent(ctx),
-			"-headers", ffmpegHeaders(ctx, referer),
-			"-i", inputURL,
-		)
-	}
-	appendInput(videoChunkURL)
-	args = append(args, "-c", "copy")
-	if cfg.MaxFilesize > 0 {
-		args = append(args, "-fs", strconv.FormatInt(cfg.MaxFilesize, 10))
+	args := []string{
+		"-hide_banner", "-loglevel", "warning",
+		"-user_agent", ffmpegUserAgent(ctx),
+		"-headers", ffmpegHeaders(ctx, referer),
+		"-i", videoChunkURL,
+		"-c", "copy",
 	}
 	args = append(args, "-f", "matroska", "-y", outputPath)
 
@@ -165,6 +188,7 @@ func recordWithFFmpegHLS(recordingCtx context.Context, ctx *config.AppContext, c
 	ctx.Logger.Info("starting ffmpeg hls recorder",
 		"username", cfg.Username,
 		"output", outputPath,
+		"input", safeURL(videoChunkURL),
 	)
 	if err := ffCmd.Start(); err != nil {
 		res.Status = StatusError
@@ -193,8 +217,21 @@ func recordWithFFmpegHLS(recordingCtx context.Context, ctx *config.AppContext, c
 		}
 	}
 
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	var durationTimer *time.Timer
+	var durationReached <-chan time.Time
+	if cfg.MaxDuration > 0 {
+		durationTimer = time.NewTimer(time.Duration(cfg.MaxDuration) * time.Minute)
+		durationReached = durationTimer.C
+		defer durationTimer.Stop()
+	}
+
+	var sizeTicker *time.Ticker
+	var checkSize <-chan time.Time
+	if cfg.MaxFilesize > 0 {
+		sizeTicker = time.NewTicker(250 * time.Millisecond)
+		checkSize = sizeTicker.C
+		defer sizeTicker.Stop()
+	}
 
 	for {
 		select {
@@ -202,10 +239,6 @@ func recordWithFFmpegHLS(recordingCtx context.Context, ctx *config.AppContext, c
 			if err != nil {
 				res.Status = StatusError
 				res.Err = fmt.Errorf("ffmpeg exited: %w", err)
-			} else if cfg.MaxDuration > 0 && time.Since(t0).Seconds() >= float64(cfg.MaxDuration*60) {
-				res.Status = StatusMaxDuration
-			} else if fi, statErr := os.Stat(outputPath); cfg.MaxFilesize > 0 && statErr == nil && fi.Size() >= cfg.MaxFilesize {
-				res.Status = StatusMaxFilesize
 			} else {
 				res.Status = StatusEnded
 				res.Err = fmt.Errorf("ffmpeg ended before the monitor stopped the recording")
@@ -218,28 +251,25 @@ func recordWithFFmpegHLS(recordingCtx context.Context, ctx *config.AppContext, c
 			stopFFmpeg()
 			goto finish
 
-		case <-ticker.C:
-			if cfg.MaxDuration > 0 && time.Since(t0).Seconds() >= float64(cfg.MaxDuration*60) {
-				ctx.Logger.Info("max duration reached",
+		case <-durationReached:
+			ctx.Logger.Info("max duration reached",
+				"username", cfg.Username,
+				"limit_minutes", cfg.MaxDuration,
+			)
+			res.Status = StatusMaxDuration
+			stopFFmpeg()
+			goto finish
+
+		case <-checkSize:
+			if fi, err := os.Stat(outputPath); err == nil && fi.Size() >= cfg.MaxFilesize {
+				ctx.Logger.Info("max filesize reached",
 					"username", cfg.Username,
-					"duration", time.Since(t0),
-					"limit_minutes", cfg.MaxDuration,
+					"size", fi.Size(),
+					"limit", cfg.MaxFilesize,
 				)
-				res.Status = StatusMaxDuration
+				res.Status = StatusMaxFilesize
 				stopFFmpeg()
 				goto finish
-			}
-			if cfg.MaxFilesize > 0 {
-				if fi, err := os.Stat(outputPath); err == nil && fi.Size() >= cfg.MaxFilesize {
-					ctx.Logger.Info("max filesize reached",
-						"username", cfg.Username,
-						"size", fi.Size(),
-						"limit", cfg.MaxFilesize,
-					)
-					res.Status = StatusMaxFilesize
-					stopFFmpeg()
-					goto finish
-				}
 			}
 		}
 	}
@@ -306,9 +336,8 @@ func sanitizeHeaderValue(v string) string {
 	return v
 }
 
-// recordWithTempFiles downloads video and audio fMP4 segments into separate
-// temp files, then merges them into a single MKV at the end. Used for the
-// older format where audio is a separate variant.
+// recordWithTempFiles downloads separate video and audio fMP4 renditions and
+// then merges them into one MKV.
 func recordWithTempFiles(recordingCtx context.Context, ctx *config.AppContext, cfg config.ChannelConfig, videoChunkURL, audioChunkURL, referer, outputPath string, t0 time.Time) (res Result) {
 	res.Username = cfg.Username
 
@@ -319,20 +348,16 @@ func recordWithTempFiles(recordingCtx context.Context, ctx *config.AppContext, c
 		return
 	}
 	videoPath := videoFile.Name()
-	defer func() {
-		videoFile.Close()
-	}()
 
 	audioFile, err := os.CreateTemp("", "rec_audio_*.bin")
 	if err != nil {
+		_ = videoFile.Close()
+		_ = os.Remove(videoPath)
 		res.Status = StatusError
 		res.Err = fmt.Errorf("create audio temp file: %w", err)
 		return
 	}
 	audioPath := audioFile.Name()
-	defer func() {
-		audioFile.Close()
-	}()
 
 	vs := trackState{url: videoChunkURL, writer: videoFile, username: cfg.Username, name: "video"}
 	as := trackState{url: audioChunkURL, writer: audioFile, username: cfg.Username, name: "audio"}
@@ -353,10 +378,7 @@ func recordWithTempFiles(recordingCtx context.Context, ctx *config.AppContext, c
 			res.Status = StatusCompleted
 		} else {
 			ctx.Logger.Error("initial track alignment failed", "username", cfg.Username, "error", err)
-			res.Status = StatusError
-			res.Err = err
-			var requestErr *requestError
-			res.FastRetry = errors.As(err, &requestErr)
+			setRecordError(&res, err)
 		}
 		goto finish
 	}
@@ -367,10 +389,7 @@ func recordWithTempFiles(recordingCtx context.Context, ctx *config.AppContext, c
 				res.Status = StatusCompleted
 			} else {
 				ctx.Logger.Error("video track error", "username", cfg.Username, "error", err)
-				res.Status = StatusError
-				res.Err = err
-				var requestErr *requestError
-				res.FastRetry = errors.As(err, &requestErr)
+				setRecordError(&res, err)
 			}
 			goto finish
 		}
@@ -380,10 +399,7 @@ func recordWithTempFiles(recordingCtx context.Context, ctx *config.AppContext, c
 				res.Status = StatusCompleted
 			} else {
 				ctx.Logger.Error("audio track error", "username", cfg.Username, "error", err)
-				res.Status = StatusError
-				res.Err = err
-				var requestErr *requestError
-				res.FastRetry = errors.As(err, &requestErr)
+				setRecordError(&res, err)
 			}
 			goto finish
 		}
@@ -401,13 +417,23 @@ func recordWithTempFiles(recordingCtx context.Context, ctx *config.AppContext, c
 			goto finish
 		}
 
-		if cfg.MaxDuration > 0 && time.Since(t0).Seconds() >= float64(cfg.MaxDuration*60) {
+		if maxDurationReached(cfg.MaxDuration, vs.duration, as.duration) {
 			ctx.Logger.Info("max duration reached",
 				"username", cfg.Username,
-				"duration", time.Since(t0),
+				"video_duration", time.Duration(vs.duration*float64(time.Second)),
+				"audio_duration", time.Duration(as.duration*float64(time.Second)),
 				"limit_minutes", cfg.MaxDuration,
 			)
 			res.Status = StatusMaxDuration
+			goto finish
+		}
+		if maxFilesizeReached(cfg.MaxFilesize, vs.size, as.size) {
+			ctx.Logger.Info("max filesize reached",
+				"username", cfg.Username,
+				"captured_size", vs.size+as.size,
+				"limit", cfg.MaxFilesize,
+			)
+			res.Status = StatusMaxFilesize
 			goto finish
 		}
 
@@ -421,11 +447,49 @@ func recordWithTempFiles(recordingCtx context.Context, ctx *config.AppContext, c
 	}
 
 finish:
-	videoFile.Close()
-	audioFile.Close()
+	if closeErr := errors.Join(videoFile.Close(), audioFile.Close()); closeErr != nil {
+		res.Status = StatusError
+		res.Err = errors.Join(res.Err, fmt.Errorf("close temporary media: %w", closeErr))
+		res.Duration = time.Since(t0)
+		res.Path = outputPath
+		ctx.Logger.Error("failed to close temporary media",
+			"username", cfg.Username,
+			"video_tmp", videoPath,
+			"audio_tmp", audioPath,
+			"error", closeErr,
+		)
+		return
+	}
 
 	finalizeTempRecording(ctx, cfg.Username, videoPath, audioPath, outputPath, t0, &res)
 	return
+}
+
+func maxDurationReached(maxMinutes int, durations ...float64) bool {
+	if maxMinutes <= 0 {
+		return false
+	}
+	limit := float64(maxMinutes * 60)
+	for _, duration := range durations {
+		if duration >= limit {
+			return true
+		}
+	}
+	return false
+}
+
+func maxFilesizeReached(maxBytes int64, sizes ...int64) bool {
+	if maxBytes <= 0 {
+		return false
+	}
+	var total int64
+	for _, size := range sizes {
+		if size >= maxBytes-total {
+			return true
+		}
+		total += size
+	}
+	return false
 }
 
 func finalizeTempRecording(ctx *config.AppContext, username, videoPath, audioPath, outputPath string, t0 time.Time, res *Result) {
@@ -553,17 +617,12 @@ func fetchAndSelectVariant(reqCtx context.Context, ctx *config.AppContext, hlsSo
 	videoURL, audioURL string, hasAudio bool, err error,
 ) {
 	referer := fmt.Sprintf("https://chaturbate.com/%s/", cfg.Username)
-	resp, err := ctx.Resty.R().SetContext(reqCtx).SetHeader("Referer", referer).Get(hlsSource)
+	body, err := fetchHTTPBytes(reqCtx, ctx, referer, "master playlist", hlsSource)
 	if err != nil {
-		return "", "", false, &requestError{fmt.Errorf("fetch master playlist: %w", err)}
-	}
-	if resp.StatusCode() != 200 {
-		return "", "", false, &requestError{fmt.Errorf("master playlist HTTP %d", resp.StatusCode())}
+		return "", "", false, err
 	}
 
-	body := resp.String()
-
-	playlist, listType, err := m3u8.DecodeFrom(strings.NewReader(body), true)
+	playlist, listType, err := m3u8.DecodeFrom(bytes.NewReader(body), true)
 	if err != nil {
 		return "", "", false, fmt.Errorf("parse master playlist: %w", err)
 	}
@@ -573,52 +632,99 @@ func fetchAndSelectVariant(reqCtx context.Context, ctx *config.AppContext, hlsSo
 
 	master := playlist.(*m3u8.MasterPlaylist)
 
-	targetHeight := cfg.Resolution
+	best := selectVariant(master, cfg.Resolution, cfg.Framerate)
+	if best == nil {
+		return "", "", false, fmt.Errorf("no video variant found")
+	}
+	videoURL, err = resolveURL(hlsSource, best.URI)
+	if err != nil {
+		return "", "", false, fmt.Errorf("resolve video playlist URI: %w", err)
+	}
+
+	for _, alt := range best.Alternatives {
+		if alt != nil && alt.Type == "AUDIO" && alt.GroupId == best.Audio && alt.URI != "" {
+			audioURL, err = resolveURL(hlsSource, alt.URI)
+			if err != nil {
+				return "", "", false, fmt.Errorf("resolve audio playlist URI: %w", err)
+			}
+			ctx.Logger.Debug("HLS variant selected",
+				"username", cfg.Username,
+				"resolution", best.Resolution,
+				"framerate", best.FrameRate,
+				"bandwidth", best.Bandwidth,
+				"video", safeURL(videoURL),
+				"audio", safeURL(audioURL),
+			)
+			return videoURL, audioURL, true, nil
+		}
+	}
+
+	ctx.Logger.Debug("HLS variant selected without separate audio",
+		"username", cfg.Username,
+		"resolution", best.Resolution,
+		"framerate", best.FrameRate,
+		"bandwidth", best.Bandwidth,
+		"video", safeURL(videoURL),
+	)
+	return videoURL, "", false, nil
+}
+
+func selectVariant(master *m3u8.MasterPlaylist, targetHeight, targetFramerate int) *m3u8.Variant {
 	var best *m3u8.Variant
-	bestDist := 99999
+	var fallback *m3u8.Variant
+	bestHeightDist := math.MaxInt
+	bestFrameDist := math.Inf(1)
 	for _, v := range master.Variants {
 		if v == nil || v.URI == "" {
 			continue
+		}
+		if fallback == nil {
+			fallback = v
+		}
+		if targetHeight <= 0 {
+			return fallback
 		}
 		parts := strings.Split(v.VariantParams.Resolution, "x")
 		if len(parts) != 2 {
 			continue
 		}
-		h, _ := strconv.Atoi(parts[1])
-		dist := h - targetHeight
-		if dist < 0 {
-			dist = -dist
+		h, err := strconv.Atoi(parts[1])
+		if err != nil || h <= 0 {
+			continue
 		}
-		if dist < bestDist {
-			bestDist = dist
+		heightDist := h - targetHeight
+		if heightDist < 0 {
+			heightDist = -heightDist
+		}
+
+		frameDist := 0.0
+		if targetFramerate > 0 {
+			if v.VariantParams.FrameRate <= 0 {
+				frameDist = math.Inf(1)
+			} else {
+				frameDist = math.Abs(v.VariantParams.FrameRate - float64(targetFramerate))
+			}
+		}
+
+		if heightDist < bestHeightDist || heightDist == bestHeightDist && frameDist < bestFrameDist {
+			bestHeightDist = heightDist
+			bestFrameDist = frameDist
 			best = v
 		}
 	}
-	if best == nil {
-		return "", "", false, fmt.Errorf("no video variant found")
+	if best != nil {
+		return best
 	}
-	videoURL = resolveURL(hlsSource, best.URI)
-
-	for _, alt := range best.Alternatives {
-		if alt != nil && alt.Type == "AUDIO" && alt.GroupId == best.Audio && alt.URI != "" {
-			audioURL = resolveURL(hlsSource, alt.URI)
-			return videoURL, audioURL, true, nil
-		}
-	}
-
-	return videoURL, "", false, nil
+	return fallback
 }
 
 func fetchMediaPlaylist(recordingCtx context.Context, ctx *config.AppContext, referer string, ts *trackState) (*m3u8.MediaPlaylist, error) {
-	resp, err := ctx.Resty.R().SetContext(recordingCtx).SetHeader("Referer", referer).Get(ts.url)
+	body, err := downloadBytesWithRetry(recordingCtx, ctx, referer, ts.name+" playlist", ts.url)
 	if err != nil {
-		return nil, &requestError{fmt.Errorf("fetch %s chunklist: %w", ts.name, err)}
-	}
-	if resp.StatusCode() != 200 {
-		return nil, &requestError{fmt.Errorf("%s chunklist HTTP %d", ts.name, resp.StatusCode())}
+		return nil, err
 	}
 
-	playlist, listType, err := m3u8.DecodeFrom(strings.NewReader(resp.String()), true)
+	playlist, listType, err := m3u8.DecodeFrom(bytes.NewReader(body), true)
 	if err != nil {
 		return nil, fmt.Errorf("parse %s chunklist: %w", ts.name, err)
 	}
@@ -626,30 +732,55 @@ func fetchMediaPlaylist(recordingCtx context.Context, ctx *config.AppContext, re
 		return nil, fmt.Errorf("expected media playlist for %s, got %v", ts.name, listType)
 	}
 
-	return playlist.(*m3u8.MediaPlaylist), nil
+	media := playlist.(*m3u8.MediaPlaylist)
+	ctx.Logger.Debug("media playlist parsed",
+		"username", ts.username,
+		"track", ts.name,
+		"sequence", media.SeqNo,
+		"segments", media.Count(),
+		"closed", media.Closed,
+		"url", safeURL(ts.url),
+	)
+	return media, nil
 }
 
-func writeInitSegment(recordingCtx context.Context, ctx *config.AppContext, referer string, ts *trackState, media *m3u8.MediaPlaylist) error {
-	if !ts.wroteInit && media.Map != nil && media.Map.URI != "" {
-		initURL := resolveURL(ts.url, media.Map.URI)
-		body, err := downloadBytes(recordingCtx, ctx, referer, initURL)
-		if err != nil {
-			return fmt.Errorf("%s init segment: %w", ts.name, err)
-		}
-		if err := writeAll(ts.writer, body); err != nil {
-			return fmt.Errorf("%s init segment write: %w", ts.name, err)
-		}
-		if err := cacheDownloadedSegment(ts, segmentCacheEntry{
-			Username: ts.username,
-			Track:    ts.name,
-			Kind:     "init",
-			URI:      media.Map.URI,
-			URL:      initURL,
-		}, body); err != nil {
-			return fmt.Errorf("%s init segment cache: %w", ts.name, err)
-		}
-		ts.wroteInit = true
+func writeInitMap(recordingCtx context.Context, ctx *config.AppContext, referer string, ts *trackState, initMap *m3u8.Map) error {
+	if initMap == nil || initMap.URI == "" {
+		return nil
 	}
+	initURL, err := resolveURL(ts.url, initMap.URI)
+	if err != nil {
+		return fmt.Errorf("%s init URI: %w", ts.name, err)
+	}
+	if initURL == ts.initURL {
+		return nil
+	}
+
+	body, err := downloadBytesWithRetry(recordingCtx, ctx, referer, ts.name+" init", initURL)
+	if err != nil {
+		return fmt.Errorf("%s init segment: %w", ts.name, err)
+	}
+	if err := writeAll(ts.writer, body); err != nil {
+		return fmt.Errorf("%s init segment write: %w", ts.name, err)
+	}
+	ts.size += int64(len(body))
+	if err := cacheDownloadedSegment(ts, segmentCacheEntry{
+		Username: ts.username,
+		Track:    ts.name,
+		Kind:     "init",
+		URI:      initMap.URI,
+		URL:      initURL,
+	}, body); err != nil {
+		return fmt.Errorf("%s init segment cache: %w", ts.name, err)
+	}
+	ctx.Logger.Debug("initialization segment recorded",
+		"username", ts.username,
+		"track", ts.name,
+		"bytes", len(body),
+		"url", safeURL(initURL),
+		"changed", ts.initURL != "",
+	)
+	ts.initURL = initURL
 	return nil
 }
 
@@ -683,10 +814,10 @@ func alignInitialTracks(recordingCtx context.Context, ctx *config.AppContext, re
 		)
 	}
 
-	if err := writeInitSegment(recordingCtx, ctx, referer, video, videoMedia); err != nil {
+	if err := writeInitMap(recordingCtx, ctx, referer, video, videoMedia.Map); err != nil {
 		return err
 	}
-	if err := writeInitSegment(recordingCtx, ctx, referer, audio, audioMedia); err != nil {
+	if err := writeInitMap(recordingCtx, ctx, referer, audio, audioMedia.Map); err != nil {
 		return err
 	}
 
@@ -734,7 +865,7 @@ func processTrack(recordingCtx context.Context, ctx *config.AppContext, referer 
 	if err != nil {
 		return err
 	}
-	if err := writeInitSegment(recordingCtx, ctx, referer, ts, media); err != nil {
+	if err := writeInitMap(recordingCtx, ctx, referer, ts, media.Map); err != nil {
 		return err
 	}
 	return processTrackSegments(recordingCtx, ctx, referer, ts, media.Segments)
@@ -751,56 +882,63 @@ func processTrackSegments(recordingCtx context.Context, ctx *config.AppContext, 
 		}
 	}
 	if len(newSegments) == 0 {
+		if ts.haveLastSeq && len(segments) != 0 {
+			last := segments[len(segments)-1]
+			if last != nil && last.SeqId < ts.lastSeq {
+				return &requestError{err: fmt.Errorf(
+					"%s media sequence moved backwards: last=%d playlist_last=%d",
+					ts.name,
+					ts.lastSeq,
+					last.SeqId,
+				)}
+			}
+		}
 		return nil
 	}
 	if ts.haveLastSeq && newSegments[0].SeqId > ts.lastSeq+1 {
-		return fmt.Errorf("%s missed segment(s): last=%d next=%d", ts.name, ts.lastSeq, newSegments[0].SeqId)
+		return &requestError{err: fmt.Errorf(
+			"%s missed segment(s): last=%d next=%d",
+			ts.name,
+			ts.lastSeq,
+			newSegments[0].SeqId,
+		)}
 	}
 
 	for _, seg := range newSegments {
-		segURL := resolveURL(ts.url, seg.URI)
+		if seg.Discontinuity {
+			ctx.Logger.Warn("HLS discontinuity",
+				"username", ts.username,
+				"track", ts.name,
+				"sequence", seg.SeqId,
+			)
+		}
+		if err := writeInitMap(recordingCtx, ctx, referer, ts, seg.Map); err != nil {
+			return err
+		}
+		segURL, err := resolveURL(ts.url, seg.URI)
+		if err != nil {
+			return fmt.Errorf("%s segment seq %d URI: %w", ts.name, seg.SeqId, err)
+		}
 		if err := downloadSegmentWithRetry(recordingCtx, ctx, referer, ts, seg, segURL); err != nil {
 			return fmt.Errorf("%s segment seq %d: %w", ts.name, seg.SeqId, err)
 		}
 		ts.lastSeq = seg.SeqId
 		ts.haveLastSeq = true
 		ts.duration += seg.Duration
-		if !seg.ProgramDateTime.IsZero() {
-			if ts.firstPDT.IsZero() {
-				ts.firstPDT = seg.ProgramDateTime
-			}
-			ts.lastPDT = seg.ProgramDateTime
-		}
 	}
 
 	return nil
 }
 
 func downloadSegmentWithRetry(recordingCtx context.Context, ctx *config.AppContext, referer string, ts *trackState, seg *m3u8.MediaSegment, segURL string) error {
-	err := downloadSegment(recordingCtx, ctx, referer, ts, seg, segURL)
-	if err == nil {
-		return nil
-	}
-	select {
-	case <-recordingCtx.Done():
-		return recordingCtx.Err()
-	case <-time.After(time.Second):
-	}
-	retryErr := downloadSegment(recordingCtx, ctx, referer, ts, seg, segURL)
-	if retryErr == nil {
-		return nil
-	}
-	return fmt.Errorf("download failed after retry: %w (initial error: %v)", retryErr, err)
-}
-
-func downloadSegment(recordingCtx context.Context, ctx *config.AppContext, referer string, ts *trackState, seg *m3u8.MediaSegment, segURL string) error {
-	body, err := downloadBytes(recordingCtx, ctx, referer, segURL)
+	body, err := downloadBytesWithRetry(recordingCtx, ctx, referer, ts.name+" segment", segURL)
 	if err != nil {
 		return err
 	}
 	if err := writeAll(ts.writer, body); err != nil {
 		return err
 	}
+	ts.size += int64(len(body))
 	entry := segmentCacheEntry{
 		Username:        ts.username,
 		Track:           ts.name,
@@ -813,16 +951,58 @@ func downloadSegment(recordingCtx context.Context, ctx *config.AppContext, refer
 	if !seg.ProgramDateTime.IsZero() {
 		entry.ProgramDateTime = seg.ProgramDateTime.Format(time.RFC3339Nano)
 	}
-	return cacheDownloadedSegment(ts, entry, body)
+	if err := cacheDownloadedSegment(ts, entry, body); err != nil {
+		return err
+	}
+	ctx.Logger.Debug("media segment recorded",
+		"username", ts.username,
+		"track", ts.name,
+		"sequence", seg.SeqId,
+		"duration", seg.Duration,
+		"bytes", len(body),
+		"url", safeURL(segURL),
+	)
+	return nil
 }
 
-func downloadBytes(recordingCtx context.Context, ctx *config.AppContext, referer, segURL string) ([]byte, error) {
-	resp, err := ctx.Resty.R().SetContext(recordingCtx).SetHeader("Referer", referer).Get(segURL)
-	if err != nil {
-		return nil, &requestError{err}
+func downloadBytesWithRetry(recordingCtx context.Context, ctx *config.AppContext, referer, kind, requestURL string) ([]byte, error) {
+	body, err := fetchHTTPBytes(recordingCtx, ctx, referer, kind, requestURL)
+	if err == nil {
+		return body, nil
 	}
+	var requestErr *requestError
+	if !errors.As(err, &requestErr) || !requestErr.retrySameURL() {
+		return nil, err
+	}
+	select {
+	case <-recordingCtx.Done():
+		return nil, recordingCtx.Err()
+	case <-time.After(time.Second):
+	}
+	retryBody, retryErr := fetchHTTPBytes(recordingCtx, ctx, referer, kind+" retry", requestURL)
+	if retryErr != nil {
+		return nil, fmt.Errorf("download failed after retry: %w (initial error: %v)", retryErr, err)
+	}
+	return retryBody, nil
+}
+
+func fetchHTTPBytes(requestCtx context.Context, ctx *config.AppContext, referer, kind, requestURL string) ([]byte, error) {
+	resp, err := ctx.Resty.R().SetContext(requestCtx).SetHeader("Referer", referer).Get(requestURL)
+	if err != nil {
+		return nil, &requestError{err: fmt.Errorf("%s GET %s: %w", kind, safeURL(requestURL), err)}
+	}
+	ctx.Logger.Debug("HTTP media response",
+		"kind", kind,
+		"status", resp.StatusCode(),
+		"bytes", len(resp.Body()),
+		"content_type", resp.Header().Get("Content-Type"),
+		"url", safeURL(requestURL),
+	)
 	if resp.StatusCode() != 200 {
-		return nil, &requestError{fmt.Errorf("HTTP %d", resp.StatusCode())}
+		return nil, &requestError{
+			err:    fmt.Errorf("%s GET %s: HTTP %d", kind, safeURL(requestURL), resp.StatusCode()),
+			status: resp.StatusCode(),
+		}
 	}
 	return resp.Body(), nil
 }
@@ -861,6 +1041,8 @@ func cacheDownloadedSegment(ts *trackState, entry segmentCacheEntry, body []byte
 	hash := sha256.Sum256(body)
 	entry.SHA256 = hex.EncodeToString(hash[:])
 	entry.Size = len(body)
+	entry.URI = safeReference(entry.URI)
+	entry.URL = safeURL(entry.URL)
 
 	filename := cacheFilename(entry)
 	entry.Path = filepath.Join(trackDir, filename)
@@ -908,17 +1090,52 @@ func sanitizePathPart(s string) string {
 	return b.String()
 }
 
-func resolveURL(base, uri string) string {
-	if strings.HasPrefix(uri, "http") {
-		return uri
+func resolveURL(base, uri string) (string, error) {
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return "", fmt.Errorf("empty URI")
+	}
+	if uri[0] == '"' || uri[0] == '\'' || uri[len(uri)-1] == '"' || uri[len(uri)-1] == '\'' {
+		return "", fmt.Errorf("URI contains an unexpected surrounding quote")
 	}
 	baseURL, err := url.Parse(base)
 	if err != nil {
-		return base + "/" + uri
+		return "", fmt.Errorf("parse base URL: %w", err)
+	}
+	if (baseURL.Scheme != "http" && baseURL.Scheme != "https") || baseURL.Host == "" {
+		return "", fmt.Errorf("base URL must be absolute HTTP(S)")
 	}
 	ref, err := url.Parse(uri)
 	if err != nil {
-		return base + "/" + uri
+		return "", fmt.Errorf("parse URI: %w", err)
 	}
-	return baseURL.ResolveReference(ref).String()
+	resolved := baseURL.ResolveReference(ref)
+	if (resolved.Scheme != "http" && resolved.Scheme != "https") || resolved.Host == "" {
+		return "", fmt.Errorf("resolved URL must be absolute HTTP(S)")
+	}
+	return resolved.String(), nil
+}
+
+func safeURL(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "<invalid-url>"
+	}
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.User = nil
+	return parsed.String()
+}
+
+func safeReference(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "<invalid-uri>"
+	}
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.User = nil
+	return parsed.String()
 }

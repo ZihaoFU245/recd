@@ -61,6 +61,22 @@ func TestMonitorLifecycle(t *testing.T) {
 	}
 }
 
+func TestMonitorRunRecoversPanicAndStops(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mon := New(config.NewAppContext(logger, nil), []config.ChannelConfig{{Username: "panic_user"}})
+	mon.checking = nil // Force tick's map assignment to panic inside Run.
+
+	go mon.Run()
+	select {
+	case <-mon.Done():
+	case <-time.After(time.Second):
+		t.Fatal("monitor did not recover its event-loop panic")
+	}
+	if mon.runCtx.Err() == nil {
+		t.Fatal("monitor panic recovery did not cancel its context")
+	}
+}
+
 func TestMonitorStatusChecksDoNotBlockEachOther(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	ctx := config.NewAppContext(logger, nil)
@@ -90,6 +106,23 @@ func TestMonitorStatusChecksDoNotBlockEachOther(t *testing.T) {
 	case <-mon.Done():
 	case <-time.After(time.Second):
 		t.Fatal("monitor did not stop after concurrent status checks")
+	}
+}
+
+func TestStatusProbeRecoversPanic(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := config.NewAppContext(logger, nil)
+	ctx.Resty.SetTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		panic("transport failure")
+	}))
+	mon := New(ctx, []config.ChannelConfig{{Username: "panic_user"}})
+
+	status := mon.probeStreamStatus("panic_user")
+	if status.err == nil || !strings.Contains(status.err.Error(), "status probe panic") {
+		t.Fatalf("probe status error = %v, want recovered panic", status.err)
+	}
+	if status.online || status.hlsSource != "" {
+		t.Fatalf("unexpected recovered status: online=%v hls=%q", status.online, status.hlsSource)
 	}
 }
 
@@ -191,6 +224,60 @@ func TestParseRoomDossierAllowsEscapedQuoteSemicolon(t *testing.T) {
 	}
 	if dossier.RoomStatus != "public" || dossier.HlsSource == "" || dossier.BroadcasterUsername != "quoted_user" {
 		t.Fatalf("unexpected dossier: %+v", dossier)
+	}
+}
+
+func TestParseRoomDossierSkipsNonAssignmentMarker(t *testing.T) {
+	html := `<script>const initialRoomDossierHelper = "not the dossier";</script>` +
+		roomDossierHTML(config.RoomDossier{
+			RoomStatus:          "public",
+			HlsSource:           "https://edge.example.test/live.m3u8",
+			BroadcasterUsername: "real_user",
+		})
+	dossier, err := parseRoomDossier(html)
+	if err != nil {
+		t.Fatalf("parseRoomDossier() error: %v", err)
+	}
+	if dossier.BroadcasterUsername != "real_user" {
+		t.Fatalf("unexpected dossier: %+v", dossier)
+	}
+}
+
+func TestCheckStreamStatusRejectsBroadcasterMismatch(t *testing.T) {
+	ctx := testContext()
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return response(req, 200, "text/html", []byte(roomDossierHTML(config.RoomDossier{
+			RoomStatus:          "public",
+			HlsSource:           "https://edge.example.test/live.m3u8",
+			BroadcasterUsername: "different_user",
+		}))), nil
+	}))
+	mon := New(ctx, []config.ChannelConfig{{Username: "requested_user"}})
+	online, hlsSource, err := mon.checkStreamStatus(mon.runCtx, "requested_user")
+	if err == nil || !strings.Contains(err.Error(), "broadcaster mismatch") {
+		t.Fatalf("checkStreamStatus() error = %v", err)
+	}
+	if online || hlsSource != "" {
+		t.Fatalf("unexpected status: online=%v hls=%q", online, hlsSource)
+	}
+}
+
+func TestCheckStreamStatusDropsHLSURLForNonPublicRoom(t *testing.T) {
+	ctx := testContext()
+	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return response(req, 200, "text/html", []byte(roomDossierHTML(config.RoomDossier{
+			RoomStatus:          "private",
+			HlsSource:           "https://edge.example.test/stale.m3u8",
+			BroadcasterUsername: "private_user",
+		}))), nil
+	}))
+	mon := New(ctx, []config.ChannelConfig{{Username: "private_user"}})
+	online, hlsSource, err := mon.checkStreamStatus(mon.runCtx, "private_user")
+	if err != nil {
+		t.Fatalf("checkStreamStatus() error: %v", err)
+	}
+	if online || hlsSource != "" {
+		t.Fatalf("unexpected status: online=%v hls=%q", online, hlsSource)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"text/template"
 	"time"
 )
@@ -74,20 +75,38 @@ type PatternVars struct {
 	Sequence int
 }
 
+// PathPattern is a compiled output path template. Reusing it avoids parsing the
+// same pattern for every filename collision check.
+type PathPattern struct {
+	tmpl *template.Template
+}
+
+func CompilePathPattern(pattern string) (*PathPattern, error) {
+	tmpl, err := template.New("path").Parse(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("pattern parse error: %w", err)
+	}
+	return &PathPattern{tmpl: tmpl}, nil
+}
+
+func (p *PathPattern) Expand(vars PatternVars) (string, error) {
+	var buf bytes.Buffer
+	if err := p.tmpl.Execute(&buf, vars); err != nil {
+		return "", fmt.Errorf("pattern exec error: %w", err)
+	}
+	return buf.String(), nil
+}
+
 // ExpandPattern renders a Go template pattern into a file path.
 // The pattern uses Go template syntax, e.g.:
 //
 //	videos/{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}
 func ExpandPattern(pattern string, vars PatternVars) (string, error) {
-	tmpl, err := template.New("path").Parse(pattern)
+	compiled, err := CompilePathPattern(pattern)
 	if err != nil {
-		return "", fmt.Errorf("pattern parse error: %w", err)
+		return "", err
 	}
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, vars); err != nil {
-		return "", fmt.Errorf("pattern exec error: %w", err)
-	}
-	return buf.String(), nil
+	return compiled.Expand(vars)
 }
 
 // PathVars creates PatternVars from a username and an optional start time.
@@ -95,12 +114,12 @@ func ExpandPattern(pattern string, vars PatternVars) (string, error) {
 func PathVars(username string, t time.Time, seq int) PatternVars {
 	return PatternVars{
 		Username: username,
-		Year:     fmt.Sprintf("%04d", t.Year()),
-		Month:    fmt.Sprintf("%02d", int(t.Month())),
-		Day:      fmt.Sprintf("%02d", t.Day()),
-		Hour:     fmt.Sprintf("%02d", t.Hour()),
-		Minute:   fmt.Sprintf("%02d", t.Minute()),
-		Second:   fmt.Sprintf("%02d", t.Second()),
+		Year:     t.Format("2006"),
+		Month:    t.Format("01"),
+		Day:      t.Format("02"),
+		Hour:     t.Format("15"),
+		Minute:   t.Format("04"),
+		Second:   t.Format("05"),
 		Sequence: seq,
 	}
 }
@@ -114,7 +133,67 @@ func ParseConfig(path string) ([]ChannelConfig, error) {
 	if err := json.Unmarshal(data, &configs); err != nil {
 		return nil, err
 	}
+	if err := ValidateConfigs(configs); err != nil {
+		return nil, err
+	}
 	return configs, nil
+}
+
+func ValidateConfigs(configs []ChannelConfig) error {
+	seen := make(map[string]struct{}, len(configs))
+	for index, cfg := range configs {
+		if !validUsername(cfg.Username) {
+			return fmt.Errorf(
+				"channel %d has invalid username %q: use only ASCII letters, digits, and underscores",
+				index,
+				cfg.Username,
+			)
+		}
+		key := strings.ToLower(cfg.Username)
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("channel %d duplicates username %q", index, cfg.Username)
+		}
+		seen[key] = struct{}{}
+
+		if cfg.Resolution < 0 {
+			return fmt.Errorf("channel %q has negative resolution", cfg.Username)
+		}
+		if cfg.Framerate < 0 {
+			return fmt.Errorf("channel %q has negative framerate", cfg.Username)
+		}
+		if cfg.MaxDuration < 0 {
+			return fmt.Errorf("channel %q has negative max_duration", cfg.Username)
+		}
+		if cfg.MaxFilesize < 0 {
+			return fmt.Errorf("channel %q has negative max_filesize", cfg.Username)
+		}
+		if cfg.IsPaused {
+			continue
+		}
+		if strings.TrimSpace(cfg.Pattern) == "" {
+			return fmt.Errorf("channel %q has an empty output pattern", cfg.Username)
+		}
+		if _, err := CompilePathPattern(cfg.Pattern); err != nil {
+			return fmt.Errorf("channel %q has an invalid output pattern: %w", cfg.Username, err)
+		}
+	}
+	return nil
+}
+
+func validUsername(username string) bool {
+	if username == "" {
+		return false
+	}
+	for _, r := range username {
+		if r >= 'a' && r <= 'z' ||
+			r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' ||
+			r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func ParseHeaders(path string) (map[string]string, error) {

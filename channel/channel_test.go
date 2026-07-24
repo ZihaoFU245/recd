@@ -1,8 +1,11 @@
 package channel
 
 import (
+	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,12 +30,6 @@ func TestChannelLifecycle(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("channel Run() did not return after Stop()")
-	}
-	ch.mu.Lock()
-	active := ch.active
-	ch.mu.Unlock()
-	if active {
-		t.Error("expected channel to be inactive after Stop()")
 	}
 }
 
@@ -76,5 +73,26 @@ func TestChannelStopPublishesSession(t *testing.T) {
 	result := <-resultCh
 	if result.Session != 7 || result.Status != StatusCompleted {
 		t.Fatalf("unexpected stop result: %+v", result)
+	}
+}
+
+func TestChannelRecoversRecorderPanicAndPublishesError(t *testing.T) {
+	ctx := &config.AppContext{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Resty:  nil,
+	}
+	resultCh := make(chan Result, 1)
+	ch := New(ctx, config.ChannelConfig{
+		Username: "panic_user",
+		Pattern:  filepath.Join(t.TempDir(), "panic"),
+	}, "https://stream.test/master.m3u8", 9, resultCh, nil)
+
+	ch.Run()
+	result := <-resultCh
+	if result.Status != StatusError || result.Session != 9 {
+		t.Fatalf("unexpected panic result: %+v", result)
+	}
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "panic") {
+		t.Fatalf("panic error = %v", result.Err)
 	}
 }
