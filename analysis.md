@@ -264,8 +264,9 @@ checks.
 ## 6. Recorder implementation audit
 
 The implementation is one Go process with goroutines, not one OS process per
-channel. Each active target gets one `channel.Channel` goroutine; `ffmpeg` is
-the external subprocess used for direct HLS capture or final remuxing.
+channel. Each active target gets one `recorder.Recorder` goroutine; `ffmpeg`
+and `ffprobe` are external subprocesses used to ingest combined HLS variants or
+to finalize and validate captured tracks.
 
 Verified behavior in the current code:
 
@@ -277,23 +278,25 @@ Verified behavior in the current code:
   stopping or rescheduling a newer worker.
 - The shared Resty client has the required default user agent and a 10-second
   timeout. Recorder requests also carry their recording context and referer.
-- `fetchAndSelectVariant` parses the master, chooses the closest resolution
+- `fetchAndSelectStreams` parses the master, chooses the closest resolution
   height, and uses configured frame rate to choose among equally close
   resolutions. It resolves both video and matching separate-audio URLs.
-- For separate audio/video playlists, `recordWithTempFiles` aligns initial
-  complete segments by program time, downloads unseen full segments, errors on
-  a sequence gap, enforces duration and combined-track byte limits, and remuxes
-  the two temporary fMP4 tracks to MKV.
-- For a media playlist without separate audio,
-  `recordWithFFmpegHLS` lets `ffmpeg` read HLS and stream-copy to MKV.
-- Optional `RECD_SEGMENT_CACHE_DIR` caching records init/media objects plus a
-  JSONL manifest with sanitized URI/path, size, SHA-256, duration, and program
-  time. Signed query credentials are not logged or retained in the manifest.
+- For matching separate audio/video playlists, the recorder aligns their
+  initial complete segments by program time, then runs independent, ordered
+  track workers so a slow video request does not delay audio or vice versa.
+- For variants whose media playlist contains both audio and video, `ffmpeg`
+  reads HLS directly and stream-copies it into the partial MKV.
+- Every track worker owns a lazily allocated reusable response buffer capped at
+  16 MiB. It downloads unseen full segments, errors on a sequence gap, and
+  appends only complete responses to its temporary fMP4 track.
+- Finalization remuxes the two temporary tracks to a same-directory partial MKV,
+  verifies video, audio, and positive duration with `ffprobe`, and atomically
+  publishes the final path. Temporary tracks are removed only after success.
 - Debug logging reports room status, selected rendition metadata, playlist
   sequence/count, sanitized request paths and status codes, and each committed
   segment without exposing token/session query strings.
 - Terminal statuses are `completed`, `max_duration`, `max_filesize`, `error`,
-  `desync`, and `ended`. `ended` is treated as an unexpected recorder exit.
+  and `desync`. An unexpected `ffmpeg` exit is reported as `error`.
 
 ### Current limitations
 
@@ -303,8 +306,9 @@ Verified behavior in the current code:
 2. **Session recovery occurs outside the recorder.** A request failure exits
    the recording attempt so the monitor can probe the room again. The recorder
    should not reuse the consumed master token itself.
-3. **Temporary files are intentionally retained on failed/empty remuxes for
-   diagnosis.** They are removed after a successful merge.
+3. **Temporary files are intentionally retained on failed/invalid remuxes for
+   diagnosis.** They are removed after successful ffprobe validation and
+   publication. Their location follows the Unix `TMPDIR` environment.
 
 On the separate-track path, maximum file size is checked after complete
 segments are written and uses the combined bytes captured for the two tracks.
@@ -332,9 +336,9 @@ master process
   -> monitor each room page
   -> decode initialRoomDossier
   -> require public status plus hls_source
-  -> start one channel goroutine
+  -> start one recorder goroutine
   -> consume the tokenized master URL once
-  -> select video resolution/frame rate and matching audio rendition
+  -> select video resolution/frame rate and, when present, its audio rendition
   -> poll short LL-HLS windows
   -> download init objects and unseen complete .m4s fragments
   -> remux tracks to MKV

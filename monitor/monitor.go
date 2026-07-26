@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"recd/channel"
 	"recd/config"
+	"recd/recorder"
 )
 
 const (
@@ -19,12 +19,17 @@ const (
 	initialRetryDelay    = time.Second
 	maxRetryDelay        = 15 * time.Second
 	slowRetryDelay       = 30 * time.Second
-	shutdownTimeout      = 10 * time.Second
 )
 
-type runningChannel struct {
+type runningRecorder struct {
 	session uint64
-	channel *channel.Channel
+	cancel  context.CancelFunc
+}
+
+type recordingResult struct {
+	username string
+	session  uint64
+	result   recorder.Result
 }
 
 type streamStatus struct {
@@ -41,13 +46,13 @@ type Monitor struct {
 
 	mu          sync.Mutex
 	configs     map[string]config.ChannelConfig
-	channels    map[string]runningChannel
+	recorders   map[string]runningRecorder
 	checking    map[string]bool
 	nextCheck   map[string]time.Time
 	failures    map[string]int
 	nextSession uint64
 
-	resultCh chan channel.Result
+	resultCh chan recordingResult
 	statusCh chan streamStatus
 
 	runCtx   context.Context
@@ -69,11 +74,11 @@ func New(ctx *config.AppContext, configs []config.ChannelConfig) *Monitor {
 	return &Monitor{
 		ctx:       ctx,
 		configs:   active,
-		channels:  make(map[string]runningChannel),
+		recorders: make(map[string]runningRecorder),
 		checking:  make(map[string]bool),
 		nextCheck: make(map[string]time.Time),
 		failures:  make(map[string]int),
-		resultCh:  make(chan channel.Result, max(16, len(active)*2)),
+		resultCh:  make(chan recordingResult, max(16, len(active)*2)),
 		statusCh:  make(chan streamStatus, max(16, len(active)*2)),
 		runCtx:    runCtx,
 		cancel:    cancel,
@@ -125,16 +130,7 @@ func (m *Monitor) Run() {
 func (m *Monitor) shutdown() {
 	m.cancel()
 	m.stopAll()
-	done := make(chan struct{})
-	go func() {
-		m.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(shutdownTimeout):
-		m.ctx.Logger.Warn("timed out waiting for recording sessions to stop")
-	}
+	m.wg.Wait()
 }
 
 // tick starts every due room-status probe. Probes are independent goroutines;
@@ -196,7 +192,7 @@ func (m *Monitor) handleStatus(status streamStatus) {
 
 	if status.err != nil {
 		delay := statusRetryInterval
-		if _, recording := m.channels[status.username]; !recording {
+		if _, recording := m.recorders[status.username]; !recording {
 			m.failures[status.username]++
 			delay = retryDelay(m.failures[status.username])
 		}
@@ -207,17 +203,17 @@ func (m *Monitor) handleStatus(status streamStatus) {
 
 	if !status.online {
 		m.failures[status.username] = 0
-		if current, recording := m.channels[status.username]; recording {
-			m.ctx.Logger.Info("stream offline, stopping channel", "username", status.username)
-			current.channel.Stop()
-			delete(m.channels, status.username)
+		if current, recording := m.recorders[status.username]; recording {
+			m.ctx.Logger.Info("stream offline, stopping recorder", "username", status.username)
+			current.cancel()
+			delete(m.recorders, status.username)
 		}
 		m.nextCheck[status.username] = time.Now().Add(offlineCheckInterval)
 		return
 	}
 
-	if _, recording := m.channels[status.username]; !recording {
-		m.startChannelLocked(status.username, status.hlsSource)
+	if _, recording := m.recorders[status.username]; !recording {
+		m.startRecorderLocked(status.username, status.hlsSource)
 	} else {
 		// A session that survives until its next live check is healthy enough to
 		// reset request-failure backoff.
@@ -226,26 +222,32 @@ func (m *Monitor) handleStatus(status streamStatus) {
 	m.nextCheck[status.username] = time.Now().Add(liveCheckInterval)
 }
 
-func (m *Monitor) startChannelLocked(username, hlsSource string) {
+func (m *Monitor) startRecorderLocked(username, hlsSource string) {
 	cfg, ok := m.configs[username]
 	if !ok {
 		return
 	}
 	m.nextSession++
 	session := m.nextSession
-	ch := channel.New(m.ctx, cfg, hlsSource, session, m.resultCh, m.stopCh)
-	m.channels[username] = runningChannel{session: session, channel: ch}
+	runCtx, cancel := context.WithCancel(m.runCtx)
+	worker := recorder.New(m.ctx, cfg, hlsSource)
+	m.recorders[username] = runningRecorder{session: session, cancel: cancel}
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		ch.Run()
+		result := worker.Run(runCtx)
+		select {
+		case m.resultCh <- recordingResult{username: username, session: session, result: result}:
+		case <-m.stopCh:
+		}
 	}()
-	m.ctx.Logger.Info("stream online, starting channel", "username", username, "hls_source", hlsSource != "")
+	m.ctx.Logger.Info("stream online, starting recorder", "username", username, "hls_source", hlsSource != "")
 }
 
-func (m *Monitor) handleResult(result channel.Result) {
-	m.ctx.Logger.Info("channel finished",
-		"username", result.Username,
+func (m *Monitor) handleResult(completed recordingResult) {
+	result := completed.result
+	m.ctx.Logger.Info("recorder finished",
+		"username", completed.username,
 		"status", result.Status.String(),
 		"duration", result.Duration,
 		"size", result.Filesize,
@@ -255,35 +257,35 @@ func (m *Monitor) handleResult(result channel.Result) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	current, recording := m.channels[result.Username]
-	if !recording || current.session != result.Session {
-		m.ctx.Logger.Debug("ignoring stale channel result", "username", result.Username, "session", result.Session)
+	current, recording := m.recorders[completed.username]
+	if !recording || current.session != completed.session {
+		m.ctx.Logger.Debug("ignoring stale recorder result", "username", completed.username, "session", completed.session)
 		return
 	}
-	delete(m.channels, result.Username)
-	if _, configured := m.configs[result.Username]; !configured || m.runCtx.Err() != nil {
+	delete(m.recorders, completed.username)
+	if _, configured := m.configs[completed.username]; !configured || m.runCtx.Err() != nil {
 		return
 	}
 
-	if result.Status == channel.StatusError || result.Status == channel.StatusDesync || result.Status == channel.StatusEnded {
-		m.failures[result.Username]++
+	if result.Status == recorder.StatusError || result.Status == recorder.StatusDesync {
+		m.failures[completed.username]++
 		delay := slowRetryDelay
 		if result.FastRetry {
-			delay = retryDelay(m.failures[result.Username])
+			delay = retryDelay(m.failures[completed.username])
 		}
-		m.nextCheck[result.Username] = time.Now().Add(delay)
+		m.nextCheck[completed.username] = time.Now().Add(delay)
 		m.ctx.Logger.Warn("recording failed; scheduling stream probe",
-			"username", result.Username,
+			"username", completed.username,
 			"delay", delay,
-			"attempt", m.failures[result.Username],
+			"attempt", m.failures[completed.username],
 			"fast_retry", result.FastRetry,
 			"error", result.Err,
 		)
 		return
 	}
 
-	m.failures[result.Username] = 0
-	m.nextCheck[result.Username] = time.Now()
+	m.failures[completed.username] = 0
+	m.nextCheck[completed.username] = time.Now()
 }
 
 func retryDelay(attempt int) time.Duration {
@@ -309,9 +311,9 @@ func (m *Monitor) Reload(delta []config.ChannelConfig) {
 			delete(m.configs, cfg.Username)
 			delete(m.nextCheck, cfg.Username)
 			delete(m.failures, cfg.Username)
-			if current, recording := m.channels[cfg.Username]; recording {
-				current.channel.Stop()
-				delete(m.channels, cfg.Username)
+			if current, recording := m.recorders[cfg.Username]; recording {
+				current.cancel()
+				delete(m.recorders, cfg.Username)
 			}
 			m.ctx.Logger.Info("channel paused or removed, stopping", "username", cfg.Username)
 			continue
@@ -319,9 +321,9 @@ func (m *Monitor) Reload(delta []config.ChannelConfig) {
 
 		m.configs[cfg.Username] = cfg
 		delete(m.failures, cfg.Username)
-		if current, recording := m.channels[cfg.Username]; recording {
-			current.channel.Stop()
-			delete(m.channels, cfg.Username)
+		if current, recording := m.recorders[cfg.Username]; recording {
+			current.cancel()
+			delete(m.recorders, cfg.Username)
 		}
 		m.nextCheck[cfg.Username] = now
 	}
@@ -330,11 +332,11 @@ func (m *Monitor) Reload(delta []config.ChannelConfig) {
 func (m *Monitor) stopAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for username, current := range m.channels {
-		m.ctx.Logger.Info("shutting down channel", "username", username)
-		current.channel.Stop()
+	for username, current := range m.recorders {
+		m.ctx.Logger.Info("shutting down recorder", "username", username)
+		current.cancel()
 	}
-	m.channels = make(map[string]runningChannel)
+	m.recorders = make(map[string]runningRecorder)
 }
 
 func (m *Monitor) Stop() {

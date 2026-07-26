@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"recd/channel"
 	"recd/config"
+	"recd/recorder"
 )
 
 func testContext() *config.AppContext {
@@ -128,8 +128,16 @@ func TestStatusProbeRecoversPanic(t *testing.T) {
 
 func TestMonitorFastRequestRetry(t *testing.T) {
 	mon := New(testContext(), []config.ChannelConfig{{Username: "fast"}})
-	mon.channels["fast"] = runningChannel{session: 1}
-	mon.handleResult(channel.Result{Username: "fast", Session: 1, Status: channel.StatusError, FastRetry: true, Err: errors.New("HTTP 503")})
+	mon.recorders["fast"] = runningRecorder{session: 1, cancel: func() {}}
+	mon.handleResult(recordingResult{
+		username: "fast",
+		session:  1,
+		result: recorder.Result{
+			Status:    recorder.StatusError,
+			FastRetry: true,
+			Err:       errors.New("HTTP 503"),
+		},
+	})
 
 	delay := time.Until(mon.nextCheck["fast"])
 	if delay < 800*time.Millisecond || delay > 1100*time.Millisecond {
@@ -159,8 +167,15 @@ func TestOnlineProbePreservesBackoffForNewSession(t *testing.T) {
 
 func TestMonitorSlowRecorderRetry(t *testing.T) {
 	mon := New(testContext(), []config.ChannelConfig{{Username: "ended"}})
-	mon.channels["ended"] = runningChannel{session: 1}
-	mon.handleResult(channel.Result{Username: "ended", Session: 1, Status: channel.StatusEnded, Err: errors.New("ffmpeg exited")})
+	mon.recorders["ended"] = runningRecorder{session: 1, cancel: func() {}}
+	mon.handleResult(recordingResult{
+		username: "ended",
+		session:  1,
+		result: recorder.Result{
+			Status: recorder.StatusError,
+			Err:    errors.New("ffmpeg exited"),
+		},
+	})
 
 	delay := time.Until(mon.nextCheck["ended"])
 	if delay < slowRetryDelay-time.Second || delay > slowRetryDelay+time.Second {
@@ -170,18 +185,22 @@ func TestMonitorSlowRecorderRetry(t *testing.T) {
 
 func TestMonitorIgnoresStaleResult(t *testing.T) {
 	mon := New(testContext(), []config.ChannelConfig{{Username: "same"}})
-	mon.channels["same"] = runningChannel{session: 2}
-	mon.handleResult(channel.Result{Username: "same", Session: 1, Status: channel.StatusError, FastRetry: true})
-	if got := mon.channels["same"].session; got != 2 {
+	mon.recorders["same"] = runningRecorder{session: 2, cancel: func() {}}
+	mon.handleResult(recordingResult{
+		username: "same",
+		session:  1,
+		result:   recorder.Result{Status: recorder.StatusError, FastRetry: true},
+	})
+	if got := mon.recorders["same"].session; got != 2 {
 		t.Fatalf("stale result replaced current session: got %d", got)
 	}
 }
 
 func TestMonitorStatusFailureKeepsRecording(t *testing.T) {
 	mon := New(testContext(), []config.ChannelConfig{{Username: "running"}})
-	mon.channels["running"] = runningChannel{session: 1}
+	mon.recorders["running"] = runningRecorder{session: 1, cancel: func() {}}
 	mon.handleStatus(streamStatus{username: "running", err: errors.New("temporary failure")})
-	if _, ok := mon.channels["running"]; !ok {
+	if _, ok := mon.recorders["running"]; !ok {
 		t.Fatal("status failure stopped a healthy recording")
 	}
 	if delay := time.Until(mon.nextCheck["running"]); delay < statusRetryInterval-time.Second {
@@ -193,15 +212,22 @@ func TestMonitorReloadRemovesAndReplaces(t *testing.T) {
 	ctx := testContext()
 	old := config.ChannelConfig{Username: "reload", Resolution: 480}
 	mon := New(ctx, []config.ChannelConfig{old})
-	mon.channels["reload"] = runningChannel{session: 1, channel: channel.New(ctx, old, "", 1, nil, nil)}
+	cancelled := false
+	mon.recorders["reload"] = runningRecorder{
+		session: 1,
+		cancel:  func() { cancelled = true },
+	}
 
 	newCfg := config.ChannelConfig{Username: "reload", Resolution: 720}
 	mon.Reload([]config.ChannelConfig{newCfg})
 	if got := mon.configs["reload"].Resolution; got != 720 {
 		t.Fatalf("resolution = %d, want 720", got)
 	}
-	if _, ok := mon.channels["reload"]; ok {
+	if _, ok := mon.recorders["reload"]; ok {
 		t.Fatal("old recording still tracked after reload")
+	}
+	if !cancelled {
+		t.Fatal("old recorder was not cancelled")
 	}
 	if mon.nextCheck["reload"].After(time.Now().Add(time.Second)) {
 		t.Fatal("reload did not schedule an immediate probe")
@@ -281,7 +307,7 @@ func TestCheckStreamStatusDropsHLSURLForNonPublicRoom(t *testing.T) {
 	}
 }
 
-func TestMonitorDoneChannel(t *testing.T) {
+func TestMonitorDoneSignal(t *testing.T) {
 	mon := New(testContext(), nil)
 	select {
 	case <-mon.Done():
