@@ -4,6 +4,8 @@
 go build -o recd main.go
 
 ./recd --extra-headers=<Json file> config.json
+
+# Use --http3 for H3
 ```
 
 **Config**

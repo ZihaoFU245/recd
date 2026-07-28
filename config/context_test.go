@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+
+	"github.com/quic-go/quic-go/http3"
 )
 
 func TestAppContext(t *testing.T) {
@@ -12,7 +14,7 @@ func TestAppContext(t *testing.T) {
 		"User-Agent": "TestAgent/1.0",
 		"X-Custom":   "value",
 	}
-	ctx := NewAppContext(logger, headers)
+	ctx := NewAppContext(logger, headers, false)
 
 	if ctx.Resty == nil {
 		t.Error("expected non-nil resty client")
@@ -33,7 +35,7 @@ func TestAppContext(t *testing.T) {
 
 func TestAppContext_NilHeaders(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	ctx := NewAppContext(logger, nil)
+	ctx := NewAppContext(logger, nil, false)
 
 	if ctx.Resty == nil {
 		t.Error("expected non-nil resty client")
@@ -43,5 +45,21 @@ func TestAppContext_NilHeaders(t *testing.T) {
 	}
 	if got := ctx.Resty.Header.Get("User-Agent"); got != DefaultUserAgent {
 		t.Errorf("expected default User-Agent, got %q", got)
+	}
+}
+
+func TestAppContext_HTTP3(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	ctx := NewAppContext(logger, nil, true)
+
+	_, ok := ctx.Resty.GetClient().Transport.(*http3.Transport)
+	if !ok {
+		t.Fatalf("expected HTTP/3 transport, got %T", ctx.Resty.GetClient().Transport)
+	}
+	if err := ctx.Close(); err != nil {
+		t.Fatalf("close HTTP/3 transport: %v", err)
+	}
+	if err := ctx.Close(); err != nil {
+		t.Fatalf("close HTTP/3 transport a second time: %v", err)
 	}
 }

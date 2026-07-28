@@ -18,6 +18,7 @@ import (
 func main() {
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	headersPath := flag.String("extra-headers", "", "path to JSON file with extra HTTP headers (key-value pairs)")
+	http3Enabled := flag.Bool("http3", false, "use HTTP/3 for all Resty requests (no HTTP/2 or HTTP/1.1 fallback)")
 	pidFile := flag.String("pid-file", "recd.pid", "path to PID file")
 	reload := flag.Bool("reload", false, "send SIGHUP to running recd process (reads --pid-file)")
 	flag.Parse()
@@ -62,7 +63,7 @@ func main() {
 	slog.SetDefault(logger)
 
 	if flag.NArg() < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: recd [--log-level=<level>] [--extra-headers=<path>] [--pid-file=<path>] <config.json>\n")
+		fmt.Fprintf(os.Stderr, "Usage: recd [--log-level=<level>] [--extra-headers=<path>] [--http3] [--pid-file=<path>] <config.json>\n")
 		os.Exit(1)
 	}
 
@@ -114,7 +115,13 @@ func main() {
 
 	logger.Info("master loaded channels", "total", len(allConfigs), "active", len(targets))
 
-	ctx := config.NewAppContext(logger, headers)
+	ctx := config.NewAppContext(logger, headers, *http3Enabled)
+	defer func() {
+		if err := ctx.Close(); err != nil {
+			logger.Warn("failed to close HTTP transport", "error", err)
+		}
+	}()
+	logger.Info("HTTP client configured", "http3", *http3Enabled)
 
 	mon := monitor.New(ctx, targets)
 	go mon.Run()

@@ -390,7 +390,7 @@ func TestNextOutputPathAddsSequence(t *testing.T) {
 }
 
 func testApp(transport http.RoundTripper) *config.AppContext {
-	app := config.NewAppContext(slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	app := config.NewAppContext(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, false)
 	if transport != nil {
 		app.Resty.SetTransport(transport)
 	}

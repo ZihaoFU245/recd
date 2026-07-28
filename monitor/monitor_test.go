@@ -20,7 +20,7 @@ import (
 
 func testContext() *config.AppContext {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	ctx := config.NewAppContext(logger, nil)
+	ctx := config.NewAppContext(logger, nil, false)
 	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return response(req, 200, "text/html", []byte(roomDossierHTML(config.RoomDossier{
 			RoomStatus:          "offline",
@@ -32,7 +32,7 @@ func testContext() *config.AppContext {
 
 func TestMonitorStopCancelsStreamStatusCheck(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	ctx := config.NewAppContext(logger, nil)
+	ctx := config.NewAppContext(logger, nil, false)
 	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		<-req.Context().Done()
 		return nil, req.Context().Err()
@@ -63,7 +63,7 @@ func TestMonitorLifecycle(t *testing.T) {
 
 func TestMonitorRunRecoversPanicAndStops(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mon := New(config.NewAppContext(logger, nil), []config.ChannelConfig{{Username: "panic_user"}})
+	mon := New(config.NewAppContext(logger, nil, false), []config.ChannelConfig{{Username: "panic_user"}})
 	mon.checking = nil // Force tick's map assignment to panic inside Run.
 
 	go mon.Run()
@@ -79,7 +79,7 @@ func TestMonitorRunRecoversPanicAndStops(t *testing.T) {
 
 func TestMonitorStatusChecksDoNotBlockEachOther(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	ctx := config.NewAppContext(logger, nil)
+	ctx := config.NewAppContext(logger, nil, false)
 	fastChecked := make(chan struct{}, 1)
 	ctx.Resty.SetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if req.URL.Path == "/slow/" {
@@ -111,7 +111,7 @@ func TestMonitorStatusChecksDoNotBlockEachOther(t *testing.T) {
 
 func TestStatusProbeRecoversPanic(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ctx := config.NewAppContext(logger, nil)
+	ctx := config.NewAppContext(logger, nil, false)
 	ctx.Resty.SetTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
 		panic("transport failure")
 	}))
